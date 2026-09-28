@@ -1,0 +1,979 @@
+{
+  "records": [
+    {
+      "ray_id": "r000-000",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9648038119258686,
+          "path_length": 1.9648038119258686,
+          "point": [
+            0.0,
+            -0.7589352731384866,
+            -0.036080283479358544
+          ],
+          "cos_incidence": 0.9978876080701926,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.4248334548660111,
+          "path_length": 2.3896372667918797,
+          "point": [
+            0.0,
+            -0.7807728020250235,
+            0.3881915476684573
+          ],
+          "cos_incidence": 0.9888936665077447,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.611825154505378,
+          "path_length": 10.001462421297258,
+          "point": [
+            0.0,
+            -0.7967185781089553,
+            8.0
+          ],
+          "cos_incidence": 0.9999978057596574,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        -0.7967185781089553,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        -0.0020948689388239003,
+        0.9999978057596574
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.001462421297258
+    },
+    {
+      "ray_id": "r000-001",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9693161563587118,
+          "path_length": 1.9693161563587118,
+          "point": [
+            0.0,
+            -0.7,
+            -0.030683843641288178
+          ],
+          "cos_incidence": 0.9961645195448391,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.4125958402161265,
+          "path_length": 2.3819119965748383,
+          "point": [
+            0.0,
+            -0.7119194138611235,
+            0.3817397916378489
+          ],
+          "cos_incidence": 0.9930459969422634,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.618646267174073,
+          "path_length": 10.00055826374891,
+          "point": [
+            0.0,
+            -0.6352229862304166,
+            8.0
+          ],
+          "cos_incidence": 0.9999493271116175,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        -0.6352229862304166,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        0.010066936426903466,
+        0.9999493271116175
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.00055826374891
+    },
+    {
+      "ray_id": "r000-002",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9751871846060265,
+          "path_length": 1.9751871846060265,
+          "point": [
+            0.0,
+            -0.640753272404183,
+            -0.02570158296647862
+          ],
+          "cos_incidence": 0.9939363171197756,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.4016171412007239,
+          "path_length": 2.3768043258067504,
+          "point": [
+            0.0,
+            -0.6433098337503291,
+            0.375907421041556
+          ],
+          "cos_incidence": 0.9962294898193422,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.625985355251062,
+          "path_length": 10.002789681057813,
+          "point": [
+            0.0,
+            -0.4734128473895679,
+            8.0
+          ],
+          "cos_incidence": 0.9997517991178261,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        -0.4734128473895679,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        0.022278692974905128,
+        0.9997517991178261
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.002789681057813
+    },
+    {
+      "ray_id": "r001-000",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9903976909416103,
+          "path_length": 1.9903976909416103,
+          "point": [
+            0.0,
+            -0.40970297434168595,
+            -0.010497920845406572
+          ],
+          "cos_incidence": 0.9997745398133012,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.371967687776543,
+          "path_length": 2.3623653787181533,
+          "point": [
+            0.0,
+            -0.423460246197821,
+            0.3612152726531619
+          ],
+          "cos_incidence": 0.9959571499218176,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.638989781852052,
+          "path_length": 10.001355160570206,
+          "point": [
+            0.0,
+            -0.4794314574832635,
+            8.0
+          ],
+          "cos_incidence": 0.9999731568556747,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        -0.4794314574832635,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        -0.007327043612286702,
+        0.9999731568556747
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.001355160570206
+    },
+    {
+      "ray_id": "r001-001",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9923400828543327,
+          "path_length": 1.9923400828543327,
+          "point": [
+            0.0,
+            -0.35,
+            -0.007659917145667272
+          ],
+          "cos_incidence": 0.9990425103567916,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.36559037636969816,
+          "path_length": 2.357930459224031,
+          "point": [
+            0.0,
+            -0.35527054609782643,
+            0.35789246574626277
+          ],
+          "cos_incidence": 0.9982693994426037,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.642202002509637,
+          "path_length": 10.000132461733667,
+          "point": [
+            0.0,
+            -0.31727209791144984,
+            8.0
+          ],
+          "cos_incidence": 0.9999876386078426,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        -0.31727209791144984,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        0.0049721857880619,
+        0.9999876386078426
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.000132461733667
+    },
+    {
+      "ray_id": "r001-002",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9956349133472422,
+          "path_length": 1.9956349133472422,
+          "point": [
+            0.0,
+            -0.29013993255258536,
+            -0.00526305501310631
+          ],
+          "cos_incidence": 0.9978045863462869,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.3604319454937439,
+          "path_length": 2.356066858840986,
+          "point": [
+            0.0,
+            -0.2871999321410039,
+            0.35515689966474595
+          ],
+          "cos_incidence": 0.9996149730324411,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.645986839959853,
+          "path_length": 10.00205369880084,
+          "point": [
+            0.0,
+            -0.15495497724390433,
+            8.0
+          ],
+          "cos_incidence": 0.9998504130796273,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        -0.15495497724390433,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        0.01729599562033695,
+        0.9998504130796273
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.00205369880084
+    },
+    {
+      "ray_id": "r002-000",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 2.0006751487330137,
+          "path_length": 2.0006751487330137,
+          "point": [
+            0.0,
+            -0.06001125182894915,
+            -0.0002250875631555349
+          ],
+          "cos_incidence": 0.9997469189033674,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.3506029615528474,
+          "path_length": 2.351278110285861,
+          "point": [
+            0.0,
+            -0.06793081450604792,
+            0.35028841742150396
+          ],
+          "cos_incidence": 0.9995170002686229,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.650295276452147,
+          "path_length": 10.00157338673801,
+          "point": [
+            0.0,
+            -0.16243224449758617,
+            8.0
+          ],
+          "cos_incidence": 0.9999237030921606,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        -0.16243224449758617,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        -0.012352651313004436,
+        0.9999237030921606
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.00157338673801
+    },
+    {
+      "ray_id": "r002-001",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 2.0,
+          "path_length": 2.0,
+          "point": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "cos_incidence": 1.0,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.34999999999999964,
+          "path_length": 2.3499999999999996,
+          "point": [
+            0.0,
+            0.0,
+            0.34999999999999964
+          ],
+          "cos_incidence": 1.0,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.65,
+          "path_length": 10.0,
+          "point": [
+            0.0,
+            0.0,
+            8.0
+          ],
+          "cos_incidence": 1.0,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        0.0,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.0
+    },
+    {
+      "ray_id": "r002-002",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 2.0006751487330137,
+          "path_length": 2.0006751487330137,
+          "point": [
+            0.0,
+            0.06001125182894915,
+            -0.0002250875631555349
+          ],
+          "cos_incidence": 0.9997469189033674,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.3506029615528474,
+          "path_length": 2.351278110285861,
+          "point": [
+            0.0,
+            0.06793081450604792,
+            0.35028841742150396
+          ],
+          "cos_incidence": 0.9995170002686229,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.650295276452147,
+          "path_length": 10.00157338673801,
+          "point": [
+            0.0,
+            0.16243224449758617,
+            8.0
+          ],
+          "cos_incidence": 0.9999237030921606,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        0.16243224449758617,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        0.012352651313004436,
+        0.9999237030921606
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.00157338673801
+    },
+    {
+      "ray_id": "r003-000",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9956349133472422,
+          "path_length": 1.9956349133472422,
+          "point": [
+            0.0,
+            0.29013993255258524,
+            -0.00526305501310631
+          ],
+          "cos_incidence": 0.9978045863462869,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.3604319454937439,
+          "path_length": 2.356066858840986,
+          "point": [
+            0.0,
+            0.2871999321410038,
+            0.35515689966474595
+          ],
+          "cos_incidence": 0.9996149730324411,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.645986839959853,
+          "path_length": 10.00205369880084,
+          "point": [
+            0.0,
+            0.15495497724390422,
+            8.0
+          ],
+          "cos_incidence": 0.9998504130796273,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        0.15495497724390422,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        -0.01729599562033695,
+        0.9998504130796273
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.00205369880084
+    },
+    {
+      "ray_id": "r003-001",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9923400828543327,
+          "path_length": 1.9923400828543327,
+          "point": [
+            0.0,
+            0.34999999999999987,
+            -0.007659917145667272
+          ],
+          "cos_incidence": 0.9990425103567916,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.36559037636969816,
+          "path_length": 2.357930459224031,
+          "point": [
+            0.0,
+            0.3552705460978263,
+            0.35789246574626277
+          ],
+          "cos_incidence": 0.9982693994426038,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.642202002509637,
+          "path_length": 10.000132461733667,
+          "point": [
+            0.0,
+            0.3172720979114498,
+            8.0
+          ],
+          "cos_incidence": 0.9999876386078426,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        0.3172720979114498,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        -0.004972185788061893,
+        0.9999876386078426
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.000132461733667
+    },
+    {
+      "ray_id": "r003-002",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9903976909416103,
+          "path_length": 1.9903976909416103,
+          "point": [
+            0.0,
+            0.40970297434168584,
+            -0.010497920845406572
+          ],
+          "cos_incidence": 0.9997745398133012,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.371967687776543,
+          "path_length": 2.3623653787181533,
+          "point": [
+            0.0,
+            0.4234602461978209,
+            0.3612152726531619
+          ],
+          "cos_incidence": 0.9959571499218176,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.638989781852052,
+          "path_length": 10.001355160570206,
+          "point": [
+            0.0,
+            0.4794314574832633,
+            8.0
+          ],
+          "cos_incidence": 0.9999731568556747,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        0.4794314574832633,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        0.007327043612286695,
+        0.9999731568556747
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.001355160570206
+    },
+    {
+      "ray_id": "r004-000",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9751871846060265,
+          "path_length": 1.9751871846060265,
+          "point": [
+            0.0,
+            0.640753272404183,
+            -0.02570158296647862
+          ],
+          "cos_incidence": 0.9939363171197756,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.4016171412007239,
+          "path_length": 2.3768043258067504,
+          "point": [
+            0.0,
+            0.6433098337503291,
+            0.375907421041556
+          ],
+          "cos_incidence": 0.9962294898193422,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.625985355251062,
+          "path_length": 10.002789681057813,
+          "point": [
+            0.0,
+            0.4734128473895679,
+            8.0
+          ],
+          "cos_incidence": 0.9997517991178261,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        0.4734128473895679,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        -0.022278692974905128,
+        0.9997517991178261
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.002789681057813
+    },
+    {
+      "ray_id": "r004-001",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9693161563587118,
+          "path_length": 1.9693161563587118,
+          "point": [
+            0.0,
+            0.7,
+            -0.030683843641288178
+          ],
+          "cos_incidence": 0.9961645195448391,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.4125958402161265,
+          "path_length": 2.3819119965748383,
+          "point": [
+            0.0,
+            0.7119194138611235,
+            0.3817397916378489
+          ],
+          "cos_incidence": 0.9930459969422634,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.618646267174073,
+          "path_length": 10.00055826374891,
+          "point": [
+            0.0,
+            0.6352229862304166,
+            8.0
+          ],
+          "cos_incidence": 0.9999493271116175,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        0.6352229862304166,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        -0.010066936426903466,
+        0.9999493271116175
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.00055826374891
+    },
+    {
+      "ray_id": "r004-002",
+      "status": "reached_image",
+      "message": "",
+      "events": [
+        {
+          "kind": "refract",
+          "surface": "front",
+          "t": 1.9648038119258686,
+          "path_length": 1.9648038119258686,
+          "point": [
+            0.0,
+            0.7589352731384866,
+            -0.036080283479358544
+          ],
+          "cos_incidence": 0.9978876080701926,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "refract",
+          "surface": "back",
+          "t": 0.4248334548660111,
+          "path_length": 2.3896372667918797,
+          "point": [
+            0.0,
+            0.7807728020250235,
+            0.3881915476684573
+          ],
+          "cos_incidence": 0.9888936665077447,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0,
+          "n_in": 1.0,
+          "n_out": 1.491
+        },
+        {
+          "kind": "image",
+          "surface": "image",
+          "t": 7.611825154505378,
+          "path_length": 10.001462421297258,
+          "point": [
+            0.0,
+            0.7967185781089553,
+            8.0
+          ],
+          "cos_incidence": 0.9999978057596574,
+          "intensity_before": 1.0,
+          "intensity_after": 1.0
+        }
+      ],
+      "final_point": [
+        0.0,
+        0.7967185781089553,
+        8.0
+      ],
+      "final_direction": [
+        0.0,
+        0.0020948689388239003,
+        0.9999978057596574
+      ],
+      "final_intensity": 1.0,
+      "path_length": 10.001462421297258
+    }
+  ]
+}
