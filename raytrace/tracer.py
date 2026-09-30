@@ -138,7 +138,7 @@ class RayTracer:
                 leaves.append(self._leaf(seed, state, "max_events", current.origin))
                 continue
 
-            hit = self._nearest_hit(current, state["last_surface"])
+            hit, blocked = self._nearest_candidate(current, state["last_surface"])
             if hit is None:
                 leaves.append(self._leaf(seed, state, "no_image", current.origin))
                 continue
@@ -166,11 +166,27 @@ class RayTracer:
                 "aperture_edge": edge_hit,
             }
 
+            if blocked:
+                event.update({
+                    "action": "aperture_clip",
+                    "final_direction": incident,
+                    "outgoing_direction": incident,
+                    "outgoing_weight": 0.0,
+                    "lost_power": weight,
+                    "absorbed_power": 0.0,
+                })
+                event["event_uid"] = event_counter
+                event_counter += 1
+                leaves.append(self._finish(seed, state, event, "aperture_clipped", point, surface.identifier))
+                continue
+
             if edge_hit or cosine < settings.grazing_cosine:
                 event.update({
                     "action": "grazing",
                     "cosine_incidence": cosine,
                     "final_direction": incident,
+                    "outgoing_direction": incident,
+                    "outgoing_weight": 0.0,
                     "absorbed_power": 0.0,
                 })
                 event["event_uid"] = event_counter
@@ -182,6 +198,8 @@ class RayTracer:
                 event.update({
                     "action": "land",
                     "final_direction": incident,
+                    "outgoing_direction": incident,
+                    "outgoing_weight": weight,
                     "absorbed_power": 0.0,
                 })
                 event["event_uid"] = event_counter
@@ -213,13 +231,15 @@ class RayTracer:
             if surface.kind == "beamsplitter":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 transmitted = tuple(incident)
-                reflected_fraction = 1.0 - surface.reflectivity
-                transmitted_fraction = surface.reflectivity
+                reflected_fraction = surface.reflectivity
+                transmitted_fraction = 1.0 - surface.reflectivity
                 reflected_weight = weight * reflected_fraction
                 transmitted_weight = weight * transmitted_fraction
                 event.update({
                     "action": "split",
                     "cosine_incidence": cosine,
+                    "reflected_fraction": reflected_fraction,
+                    "transmitted_fraction": transmitted_fraction,
                     "reflected_power": reflected_weight,
                     "transmitted_power": transmitted_weight,
                     "absorbed_power": 0.0,
@@ -251,26 +271,43 @@ class RayTracer:
                     "depth": next_depth,
                     "saw_tir": state["saw_tir"],
                 }
-                pending.append({
-                    **common,
-                    "events": list(base_events),
-                    "ray": reflected_ray,
-                    "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
-                    "parent_branch_id": state["branch_id"],
-                })
-                pending.append({
-                    **common,
-                    "events": list(base_events),
-                    "ray": transmitted_ray,
-                    "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
-                    "parent_branch_id": state["branch_id"],
-                })
+                if reflected_weight > 0.0:
+                    pending.append({
+                        **common,
+                        "events": list(base_events),
+                        "ray": reflected_ray,
+                        "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
+                        "parent_branch_id": state["branch_id"],
+                    })
+                if transmitted_weight > 0.0:
+                    pending.append({
+                        **common,
+                        "events": list(base_events),
+                        "ray": transmitted_ray,
+                        "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
+                        "parent_branch_id": state["branch_id"],
+                    })
                 continue
 
             if surface.kind == "mirror":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 absorbed = weight * (1.0 - surface.reflectivity)
                 new_weight = weight * surface.reflectivity
+                if new_weight <= 0.0:
+                    event.update({
+                        "action": "absorb",
+                        "cosine_incidence": cosine,
+                        "reflected_power": 0.0,
+                        "absorbed_power": absorbed,
+                        "transmitted_power": 0.0,
+                        "final_direction": incident,
+                        "outgoing_direction": incident,
+                        "outgoing_weight": 0.0,
+                    })
+                    event["event_uid"] = event_counter
+                    event_counter += 1
+                    leaves.append(self._finish(seed, state, event, "absorbed", point, surface.identifier))
+                    continue
                 event.update({
                     "action": "reflect",
                     "cosine_incidence": cosine,
@@ -344,15 +381,16 @@ class RayTracer:
             reflected_fraction, transmitted_fraction = fresnel_coefficients(n1, n2, cos_i)
             reflected_weight = weight * reflected_fraction
             transmitted_weight = weight * transmitted_fraction
-            absorbed_power = max(0.0, weight - reflected_weight - transmitted_weight)
             event.update({
                 "action": "refract",
                 "n_incident": n1,
                 "n_transmitted": n2,
                 "cosine_incidence": cos_i,
+                "reflected_fraction": reflected_fraction,
+                "transmitted_fraction": transmitted_fraction,
                 "reflected_power": reflected_weight,
                 "transmitted_power": transmitted_weight,
-                "absorbed_power": absorbed_power,
+                "absorbed_power": 0.0,
                 "transmitted_direction": refracted,
                 "reflected_direction": reflected,
                 "outgoing_direction": refracted,
@@ -446,7 +484,7 @@ class RayTracer:
         )
         return self._leaf(seed, advanced, status, point, detector)
 
-    def _nearest_hit(self, ray: Ray, last_surface: str | None):
+    def _nearest_candidate(self, ray: Ray, last_surface: str | None):
         candidates = []
         for surface in self.surfaces:
             intersection = surface.intersect(ray.origin, ray.direction)
@@ -457,12 +495,19 @@ class RayTracer:
                 continue
             if t <= 0:
                 continue
-            if not surface.accepts(point):
-                continue
             candidates.append((t, point, normal, surface))
         if not candidates:
-            return None
-        return min(candidates, key=lambda item: item[0])
+            return None, False
+        nearest = min(candidates, key=lambda item: item[0])
+        surface = nearest[3]
+        if not surface.accepts(nearest[1]) and surface.kind != "aperture_stop":
+            candidates = [candidate for candidate in candidates if candidate[3].accepts(candidate[1])]
+            if not candidates:
+                return None, False
+            nearest = min(candidates, key=lambda item: item[0])
+            surface = nearest[3]
+        blocked = not surface.accepts(nearest[1])
+        return nearest, blocked
 
     @staticmethod
     def _reflect(direction, normal) -> tuple[float, float, float]:

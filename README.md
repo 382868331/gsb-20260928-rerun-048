@@ -8,10 +8,12 @@
 - 圆形孔径、折射面、镜面和像面/探测器。
 - 材料表与标量折射率；`Ray.wavelength_nm` 已预留，后续可替换为色散模型。
 - Snell 折射、镜面反射、全反射、非偏振 Fresnel 反射率、平面分光片和孔径光阑。
+- `reflectivity` 在镜面和分光面上统一表示物理反射功率比例；分光面透射比例为 `1 - reflectivity`。
+- 旧工程若曾把分光面 `reflectivity` 当作透射率，读取时会把数值迁移为真实反射率，并在 `legacy_reflectivity`、`legacy_reflectivity_convention` 与 `compatibility_notes` 中显式保留原约定；旧批次结果只加兼容说明，不静默重算。
 - 折射面与分光面把每束光分裂为透射和反射两条子光束，两条子光束都继续追迹；全反射只保留反射支。
-- 每条终止子光束保留来源标签、分支编号、父分支和深度，事件带全局编号避免跨分支重复记账。
+- 每条终止子光束保留来源标签、分支编号、父分支和深度，事件带全局编号避免跨分支重复记账。`energy_flows()` 和 `detector_flows()` 可按分支追溯每次反射、透射、吸收与孔径截断；同一探测区域上的不同方向保留独立条目。
 - `TraceBatch.detector_hits`、`hits_by_source`、`detector_summary` 按探测面和来源光线汇总能量与落点。
-- `TraceBatch.energy_ledger` 分别统计到达、表面吸收、孔径擦边（`grazing`）、未到达（`no_image`）以及达到事件/分支上限而停止（`max_events`、`max_branches`）的剩余能量；停止能量不计为吸收，并给出 `unaccounted` 闭合误差。
+- `TraceBatch.energy_ledger` 分别统计到达、表面吸收、孔径外交点截断（`aperture_clipped`）、孔径擦边（`grazing`）、未到达（`no_image`）以及达到事件/分支上限而停止（`max_events`、`max_branches`）的剩余能量；停止能量不计为吸收，并给出 `unaccounted` 闭合误差。
 - `TraceSettings.max_events`、`max_branches`、`min_branch_weight` 共同约束反复反射和指数分裂。
 - `Project` 与 `TraceBatch` 可保存/读取 JSON，便于工程和追迹批次重开。
  保存工程后用同样的输入光线重新追迹，会得到相同的分支路径、终止原因、能量和落点。

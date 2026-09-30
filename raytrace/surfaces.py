@@ -63,6 +63,9 @@ class Surface:
     front_material: str = "air"
     back_material: str = "air"
     reflectivity: float = 1.0
+    reflectivity_convention: str = "reflection"
+    legacy_reflectivity: Optional[float] = None
+    legacy_reflectivity_convention: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"refract", "mirror", "detector", "beamsplitter", "aperture_stop"}:
@@ -73,6 +76,10 @@ class Surface:
             raise ValueError("a spherical surface requires a radius")
         if not 0.0 <= self.reflectivity <= 1.0:
             raise ValueError("reflectivity must be between 0 and 1")
+        if self.reflectivity_convention != "reflection":
+            raise ValueError("reflectivity must always use the physical reflection convention")
+        if self.legacy_reflectivity is not None and not 0.0 <= self.legacy_reflectivity <= 1.0:
+            raise ValueError("legacy reflectivity must be between 0 and 1")
         object.__setattr__(self, "axis", normalize(self.axis))
 
     def intersect(self, origin: Vector, direction: Vector) -> Optional[tuple[float, Vector, Vector]]:
