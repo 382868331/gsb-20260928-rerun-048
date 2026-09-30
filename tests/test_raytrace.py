@@ -1,6 +1,8 @@
 import math
+import json
 import tempfile
 import unittest
+from pathlib import Path
 
 from raytrace import (
     CircularAperture,
@@ -26,7 +28,7 @@ def _combo_surfaces(materials):
             (c, s, 0.0),
             kind="beamsplitter",
             aperture=CircularAperture(5.0),
-            reflectivity=0.96,
+            reflectivity=0.04,
         ),
         PlaneSurface(
             "clip",
@@ -220,7 +222,7 @@ class RayTraceTests(unittest.TestCase):
     def test_beamsplitter_traces_both_children_with_lineage(self):
         surfaces = [
             PlaneSurface("split", (0, 0, 0), (1, 0, 0), kind="beamsplitter",
-                         aperture=CircularAperture(2.0), reflectivity=0.7),
+                         aperture=CircularAperture(2.0), reflectivity=0.3),
             PlaneSurface("det_t", (1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
             PlaneSurface("det_r", (-1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
         ]
@@ -230,12 +232,17 @@ class RayTraceTests(unittest.TestCase):
         self.assertEqual(set(leaves), {"root.1.t", "root.1.r"})
         transmitted = leaves["root.1.t"]
         reflected = leaves["root.1.r"]
+        # reflectivity is the reflected fraction, same meaning as a mirror
         self.assertAlmostEqual(transmitted.weight, 0.7)
         self.assertAlmostEqual(reflected.weight, 0.3)
         self.assertEqual(transmitted.parent_branch_id, "root")
         self.assertEqual(reflected.source_label, "src")
         self.assertEqual(transmitted.events[-1]["action"], "land")
         self.assertEqual(reflected.events[0]["action"], "split")
+        split_event = reflected.events[0]
+        self.assertAlmostEqual(split_event["reflectivity"], 0.3)
+        self.assertAlmostEqual(split_event["transmissivity"], 0.7)
+        self.assertAlmostEqual(split_event["absorbed_power"], 0.0)
         ledger = batch.energy_ledger({"src": 1.0})
         self.assertAlmostEqual(ledger["src"]["detected"], 1.0)
         self.assertAlmostEqual(ledger["src"]["unaccounted"], 0.0)
@@ -330,6 +337,163 @@ class RayTraceTests(unittest.TestCase):
                           for leaf in recalculated.results)
         self.assertEqual(original, repeated)
         self.assertEqual(batch.energy_ledger(), recalculated.energy_ledger())
+
+    def test_zero_reflectivity_splitter_is_transparent(self):
+        surfaces = [
+            PlaneSurface("split", (0, 0, 0), (1, 0, 0), kind="beamsplitter",
+                         aperture=CircularAperture(2.0), reflectivity=0.0),
+            PlaneSurface("image", (1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        batch = Project("split", surfaces).trace_rays([Ray((-0.5, 0, 0), (1, 0, 0), label="src")])
+        self.assertEqual(set(leaf.branch_id for leaf in batch.results), {"root.1.t"})
+        leaf = batch.results[0]
+        self.assertAlmostEqual(leaf.weight, 1.0)
+        split_event = leaf.events[0]
+        self.assertEqual(split_event["action"], "split")
+        self.assertAlmostEqual(split_event["reflected_power"], 0.0)
+        self.assertAlmostEqual(split_event["transmitted_power"], 1.0)
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["detected"], 1.0)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0)
+
+    def test_full_reflectivity_splitter_reflects_all(self):
+        surfaces = [
+            PlaneSurface("split", (0, 0, 0), (1, 0, 0), kind="beamsplitter",
+                         aperture=CircularAperture(2.0), reflectivity=1.0),
+            PlaneSurface("det_t", (1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+            PlaneSurface("det_r", (-1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        batch = Project("split", surfaces).trace_rays([Ray((-0.5, 0, 0), (1, 0, 0), label="src")])
+        self.assertEqual(set(leaf.branch_id for leaf in batch.results), {"root.1.r"})
+        leaf = batch.results[0]
+        self.assertEqual(leaf.detector, "det_r")
+        self.assertAlmostEqual(leaf.weight, 1.0)
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["detected"], 1.0)
+        self.assertAlmostEqual(ledger["absorbed"], 0.0)
+
+    def test_partial_splitter_loss_closes_the_energy_account(self):
+        surfaces = [
+            PlaneSurface("split", (0, 0, 0), (1, 0, 0), kind="beamsplitter",
+                         aperture=CircularAperture(2.0),
+                         reflectivity=0.6, transmissivity=0.3),
+            PlaneSurface("det_t", (1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+            PlaneSurface("det_r", (-1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        batch = Project("lossy", surfaces).trace_rays([Ray((-0.5, 0, 0), (1, 0, 0), label="src")])
+        leaves = {leaf.branch_id: leaf for leaf in batch.results}
+        self.assertAlmostEqual(leaves["root.1.t"].weight, 0.3)
+        self.assertAlmostEqual(leaves["root.1.r"].weight, 0.6)
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["detected"], 0.9)
+        self.assertAlmostEqual(ledger["absorbed"], 0.1)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0)
+
+    def test_zero_reflectivity_mirror_absorbs_everything(self):
+        surfaces = [
+            PlaneSurface("m", (1, 0, 0), (1, 0, 0), kind="mirror",
+                         aperture=CircularAperture(2.0), reflectivity=0.0),
+        ]
+        batch = Project("black", surfaces).trace_rays([Ray((0, 0, 0), (1, 0, 0), label="src")])
+        leaf = batch.results[0]
+        self.assertEqual(leaf.status, "absorbed")
+        self.assertAlmostEqual(leaf.weight, 1.0)
+        self.assertAlmostEqual(leaf.events[-1]["absorbed_power"], 1.0)
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["absorbed"], 1.0)
+        self.assertAlmostEqual(ledger["detected"], 0.0)
+        self.assertAlmostEqual(ledger["stopped"], 0.0)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0)
+
+    def test_legacy_project_convention_is_migrated_audibly(self):
+        surfaces = [
+            PlaneSurface("split", (0, 0, 0), (1, 0, 0), kind="beamsplitter",
+                         aperture=CircularAperture(2.0), reflectivity=0.8),
+            PlaneSurface("det_t", (1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+            PlaneSurface("det_r", (-1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        project = Project("legacy", surfaces)
+        legacy_dict = project.to_dict()
+        # Simulate a file saved before the convention unification.
+        del legacy_dict["convention"]
+        migrated = Project.from_dict(legacy_dict)
+        splitter = next(s for s in migrated.surfaces if s.identifier == "split")
+        self.assertAlmostEqual(splitter.reflectivity, 0.2)
+        self.assertAlmostEqual(splitter.transmissivity, 0.8)
+        self.assertTrue(any("split" in note for note in migrated.migration_notes))
+        # The original experiment interpretation is preserved: forward beam
+        # still carries 0.8 of the energy, reflected beam 0.2.
+        batch = migrated.trace_rays([Ray((-0.5, 0, 0), (1, 0, 0), label="src")])
+        leaves = {leaf.branch_id: leaf for leaf in batch.results}
+        self.assertAlmostEqual(leaves["root.1.t"].weight, 0.8)
+        self.assertAlmostEqual(leaves["root.1.r"].weight, 0.2)
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["detected"], 1.0)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/legacy.json"
+            Path(path).write_text(json.dumps(legacy_dict), encoding="utf-8")
+            with self.assertWarns(UserWarning):
+                Project.load(path)
+
+    def test_branch_energy_flow_traces_every_direction_and_merging_sources(self):
+        # Two splitters at 45 degrees send opposite branches onto one shared
+        # detector area: merged hits must remain distinguishable by source
+        # and branch id with full event ancestry.
+        diagonal = (1.0 / math.sqrt(2.0), 1.0 / math.sqrt(2.0), 0.0)
+        surfaces = [
+            PlaneSurface("s1", (0.0, 0.0, 0.0), diagonal, kind="beamsplitter",
+                         aperture=CircularAperture(5.0), reflectivity=0.3),
+            PlaneSurface("s2", (2.0, 0.0, 0.0), diagonal, kind="beamsplitter",
+                         aperture=CircularAperture(5.0), reflectivity=0.3),
+            PlaneSurface("det_merge", (1.0, -1.0, 0.0), (0.0, -1.0, 0.0),
+                         kind="detector", aperture=CircularAperture(5.0)),
+            PlaneSurface("det_end", (4.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(5.0)),
+        ]
+        rays = [
+            Ray((-1.0, 0.2, 0.0), (1.0, 0.0, 0.0), label="a"),
+            Ray((-1.0, -0.2, 0.0), (1.0, 0.0, 0.0), label="b"),
+        ]
+        batch = Project("merge", surfaces).trace_rays(rays)
+        flows = batch.branch_energy_flow()
+        by_id = {(flow["source_label"], flow["branch_id"]): flow for flow in flows}
+
+        flow_r = by_id[("a", "root.1.r")]
+        self.assertEqual(flow_r["detector"], "det_merge")
+        self.assertAlmostEqual(flow_r["terminal_power"], 0.3)
+        split_step = flow_r["steps"][0]
+        self.assertEqual(split_step["surface"], "s1")
+        self.assertAlmostEqual(split_step["reflected_power"], 0.3)
+        self.assertAlmostEqual(split_step["transmitted_power"], 0.7)
+
+        flow_tt = by_id[("a", "root.1.t.2.t")]
+        self.assertEqual(flow_tt["detector"], "det_end")
+        self.assertAlmostEqual(flow_tt["terminal_power"], 0.7 * 0.7, places=12)
+        self.assertEqual([step["surface"] for step in flow_tt["steps"][:2]], ["s1", "s2"])
+
+        flow_tr = by_id[("a", "root.1.t.2.r")]
+        self.assertEqual(flow_tr["detector"], "det_merge")
+        self.assertAlmostEqual(flow_tr["terminal_power"], 0.7 * 0.3, places=12)
+
+        merged = batch.detector_summary()["det_merge"]
+        branch_keys = {(hit["source_label"], hit["branch_id"]) for hit in merged["branches"]}
+        self.assertIn(("a", "root.1.r"), branch_keys)
+        self.assertIn(("a", "root.1.t.2.r"), branch_keys)
+        self.assertIn(("b", "root.1.r"), branch_keys)
+        self.assertIn(("b", "root.1.t.2.r"), branch_keys)
+        self.assertEqual(merged["count"], len(merged["branches"]))
+        self.assertAlmostEqual(
+            merged["power"],
+            sum(hit["power"] for hit in merged["branches"]),
+        )
+
+        ledger_a = batch.energy_ledger({"a": 1.0, "b": 1.0})["a"]
+        total_a = (ledger_a["detected"] + ledger_a["absorbed"] + ledger_a["grazing"]
+                   + ledger_a["unreached"] + ledger_a["stopped"])
+        self.assertAlmostEqual(total_a, 1.0, places=9)
+        self.assertAlmostEqual(ledger_a["unaccounted"], 0.0)
 
 
 if __name__ == "__main__":

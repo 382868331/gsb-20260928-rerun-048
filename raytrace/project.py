@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Any
+import warnings
 
 from .materials import MaterialLibrary
 from .surfaces import CircularAperture, SphericalSurface, PlaneSurface, Surface
@@ -30,6 +31,7 @@ def _surface_from_dict(data: dict[str, Any]) -> Surface:
         "front_material": data.get("front_material", "air"),
         "back_material": data.get("back_material", "air"),
         "reflectivity": data.get("reflectivity", 1.0),
+        "transmissivity": data.get("transmissivity"),
     }
     if data["shape"] == "plane":
         return PlaneSurface(**common)
@@ -43,11 +45,22 @@ class Project:
     materials: MaterialLibrary = field(default_factory=MaterialLibrary)
     settings: TraceSettings = field(default_factory=TraceSettings)
     description: str = "Scalar-index, geometric-optics educational model"
+    # Current convention: ``reflectivity`` is always the reflected power
+    # fraction.  Projects saved before this convention stored the forward
+    # transmission fraction of a beamsplitter in ``reflectivity``; such files
+    # have no ``convention`` marker (or the explicit legacy marker below) and
+    # are migrated audibly instead of being reinterpreted silently.
+    convention: str = "physical-reflected-fraction-v1"
+    migration_notes: list[str] = field(default_factory=list)
+
+    LEGACY_CONVENTION = "legacy-beamsplitter-reflectivity-is-transmission"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
+            "convention": self.convention,
+            "migration_notes": self.migration_notes,
             "settings": vars(self.settings),
             "materials": self.materials.to_dict(),
             "surfaces": [_surface_to_dict(surface) for surface in self.surfaces],
@@ -55,20 +68,48 @@ class Project:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Project":
-        return cls(
+        project, _ = cls._from_dict_with_migration(data)
+        return project
+
+    @classmethod
+    def _from_dict_with_migration(cls, data: dict[str, Any]) -> tuple["Project", list[str]]:
+        surface_data = [dict(item) for item in data["surfaces"]]
+        stored_convention = data.get("convention")
+        legacy = stored_convention in (None, cls.LEGACY_CONVENTION)
+        new_notes: list[str] = []
+        if legacy:
+            for item in surface_data:
+                if item.get("kind") != "beamsplitter" or item.get("transmissivity") is not None:
+                    continue
+                old_value = float(item.get("reflectivity", 1.0))
+                item["transmissivity"] = old_value
+                item["reflectivity"] = 1.0 - old_value
+                new_notes.append(
+                    f"Surface {item['identifier']!r} used the legacy beamsplitter convention: "
+                    f"reflectivity={old_value:g} actually stored the forward transmission fraction. "
+                    f"Migrated to transmissivity={old_value:g}, reflectivity={1.0 - old_value:g} "
+                    "so the original physical result is preserved."
+                )
+        project = cls(
             name=data["name"],
             description=data.get("description", ""),
             settings=TraceSettings(**data.get("settings", {})),
             materials=MaterialLibrary.from_dict(data["materials"]),
-            surfaces=[_surface_from_dict(item) for item in data["surfaces"]],
+            surfaces=[_surface_from_dict(item) for item in surface_data],
+            convention="physical-reflected-fraction-v1",
+            migration_notes=new_notes + list(data.get("migration_notes", [])),
         )
+        return project, new_notes
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> "Project":
-        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+        project, new_notes = cls._from_dict_with_migration(json.loads(Path(path).read_text(encoding="utf-8")))
+        for note in new_notes:
+            warnings.warn(f"{path}: {note}", stacklevel=2)
+        return project
 
     def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
         tracer = RayTracer(self.surfaces, self.materials, self.settings)
@@ -118,6 +159,8 @@ class TraceBatch:
                 "source_label": result.source_label,
                 "branch_id": result.branch_id,
                 "parent_branch_id": result.parent_branch_id,
+                "depth": result.depth,
+                "path": [event["action"] for event in result.events],
                 "point": result.endpoint,
                 "power": result.weight,
             })
@@ -143,6 +186,7 @@ class TraceBatch:
                 "power": total_power,
                 "power_by_source": by_source,
                 "count": len(hits),
+                "branches": sorted(hits, key=lambda hit: (hit["source_label"], hit["branch_id"])),
                 "mean_point": tuple(
                     sum(hit["point"][axis] * hit["power"] for hit in hits) / total_power
                     if total_power > 0
@@ -151,6 +195,46 @@ class TraceBatch:
                 ),
             }
         return summaries
+
+    def branch_energy_flow(self) -> list[dict[str, Any]]:
+        """Traceable per-branch energy flow for every terminal sub-beam.
+
+        Each entry preserves the source ray, full branch id and ancestry,
+        every reflection/transmission/loss event with its surface and
+        powers, and the terminal state.  Hits from different branches keep
+        separate entries even when they land on the same detector region.
+        """
+
+        flows: list[dict[str, Any]] = []
+        for result in self.results:
+            steps = []
+            for event in result.events:
+                step: dict[str, Any] = {
+                    "event_uid": event["event_uid"],
+                    "surface": event["surface"],
+                    "action": event["action"],
+                    "point": event["point"],
+                    "incident_power": event.get("incident_weight"),
+                    "reflected_power": event.get("reflected_power", 0.0),
+                    "transmitted_power": event.get("transmitted_power", 0.0),
+                    "absorbed_power": event.get("absorbed_power", 0.0),
+                }
+                if "reflectivity" in event:
+                    step["reflectivity"] = event["reflectivity"]
+                    step["transmissivity"] = event["transmissivity"]
+                steps.append(step)
+            flows.append({
+                "source_label": result.source_label,
+                "branch_id": result.branch_id,
+                "parent_branch_id": result.parent_branch_id,
+                "depth": result.depth,
+                "status": result.status,
+                "detector": result.detector,
+                "endpoint": result.endpoint,
+                "terminal_power": result.weight,
+                "steps": steps,
+            })
+        return sorted(flows, key=lambda item: (item["source_label"], item["branch_id"]))
 
     def _absorbed_by_source(self) -> dict[str, float]:
         absorbed: dict[str, float] = {}
@@ -190,8 +274,12 @@ class TraceBatch:
                 "no_image": "unreached",
                 "max_events": "stopped",
                 "max_branches": "stopped",
+                # A leaf terminated by a fully absorbing surface: its power
+                # is already booked as surface absorption below.
+                "absorbed": None,
             }.get(result.status, "stopped")
-            account[bucket] += result.weight
+            if bucket is not None:
+                account[bucket] += result.weight
 
         for source, account in accounts.items():
             account["absorbed"] = absorbed.get(source, 0.0)

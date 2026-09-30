@@ -63,6 +63,7 @@ class Surface:
     front_material: str = "air"
     back_material: str = "air"
     reflectivity: float = 1.0
+    transmissivity: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"refract", "mirror", "detector", "beamsplitter", "aperture_stop"}:
@@ -73,7 +74,22 @@ class Surface:
             raise ValueError("a spherical surface requires a radius")
         if not 0.0 <= self.reflectivity <= 1.0:
             raise ValueError("reflectivity must be between 0 and 1")
+        if self.transmissivity is not None and not 0.0 <= self.transmissivity <= 1.0:
+            raise ValueError("transmissivity must be between 0 and 1")
+        if self.kind == "beamsplitter":
+            transmission = 1.0 - self.reflectivity if self.transmissivity is None else self.transmissivity
+            if self.reflectivity + transmission > 1.0 + 1e-12:
+                raise ValueError("beamsplitter reflectivity + transmissivity must not exceed 1")
         object.__setattr__(self, "axis", normalize(self.axis))
+
+    def transmission_fraction(self) -> float:
+        """Forward-transmitted power fraction; loss is ``1 - R - T``."""
+
+        if self.kind != "beamsplitter":
+            return 1.0 - self.reflectivity
+        if self.transmissivity is None:
+            return 1.0 - self.reflectivity
+        return self.transmissivity
 
     def intersect(self, origin: Vector, direction: Vector) -> Optional[tuple[float, Vector, Vector]]:
         if self.shape == "plane":

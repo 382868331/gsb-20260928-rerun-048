@@ -213,16 +213,22 @@ class RayTracer:
             if surface.kind == "beamsplitter":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 transmitted = tuple(incident)
-                reflected_fraction = 1.0 - surface.reflectivity
-                transmitted_fraction = surface.reflectivity
+                # ``reflectivity`` always means the reflected power
+                # fraction, matching mirrors; transmission defaults to the
+                # lossless complement and may be set explicitly.
+                reflected_fraction = surface.reflectivity
+                transmitted_fraction = surface.transmission_fraction()
                 reflected_weight = weight * reflected_fraction
                 transmitted_weight = weight * transmitted_fraction
+                absorbed_power = max(0.0, weight - reflected_weight - transmitted_weight)
                 event.update({
                     "action": "split",
                     "cosine_incidence": cosine,
+                    "reflectivity": reflected_fraction,
+                    "transmissivity": transmitted_fraction,
                     "reflected_power": reflected_weight,
                     "transmitted_power": transmitted_weight,
-                    "absorbed_power": 0.0,
+                    "absorbed_power": absorbed_power,
                     "transmitted_direction": transmitted,
                     "reflected_direction": reflected,
                     "outgoing_direction": transmitted,
@@ -232,39 +238,36 @@ class RayTracer:
                 event_counter += 1
                 base_events = self._extended_events(events, event, state["branch_id"], event_counter - 1)
                 next_depth = state["depth"] + 1
-                reflected_ray = Ray(
-                    self._offset(point, reflected),
-                    reflected,
-                    current.wavelength_nm,
-                    reflected_weight,
-                    seed.label,
-                )
-                transmitted_ray = Ray(
-                    self._offset(point, transmitted),
-                    transmitted,
-                    current.wavelength_nm,
-                    transmitted_weight,
-                    seed.label,
-                )
                 common = {
                     "last_surface": surface.identifier,
                     "depth": next_depth,
                     "saw_tir": state["saw_tir"],
                 }
-                pending.append({
-                    **common,
-                    "events": list(base_events),
-                    "ray": reflected_ray,
-                    "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
-                    "parent_branch_id": state["branch_id"],
-                })
-                pending.append({
-                    **common,
-                    "events": list(base_events),
-                    "ray": transmitted_ray,
-                    "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
-                    "parent_branch_id": state["branch_id"],
-                })
+                children: list[dict[str, Any]] = []
+                if reflected_weight > 0.0:
+                    children.append({
+                        **common,
+                        "events": list(base_events),
+                        "ray": Ray(self._offset(point, reflected), reflected,
+                                  current.wavelength_nm, reflected_weight, seed.label),
+                        "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
+                        "parent_branch_id": state["branch_id"],
+                    })
+                if transmitted_weight > 0.0:
+                    children.append({
+                        **common,
+                        "events": list(base_events),
+                        "ray": Ray(self._offset(point, transmitted), transmitted,
+                                  current.wavelength_nm, transmitted_weight, seed.label),
+                        "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
+                        "parent_branch_id": state["branch_id"],
+                    })
+                if children:
+                    pending.extend(children)
+                else:
+                    # Fully absorbing splitter: keep the event on a terminal
+                    # leaf so the lost power stays in the energy ledger.
+                    leaves.append(self._finish(seed, state, event, "absorbed", point, None))
                 continue
 
             if surface.kind == "mirror":
@@ -282,14 +285,17 @@ class RayTracer:
                 })
                 event["event_uid"] = event_counter
                 event_counter += 1
-                outgoing = Ray(
-                    self._offset(point, reflected),
-                    reflected,
-                    current.wavelength_nm,
-                    new_weight,
-                    seed.label,
-                )
-                pending.append(self._advance(state, event, outgoing, surface.identifier, state["saw_tir"], event_counter - 1))
+                if new_weight > 0.0:
+                    outgoing = Ray(
+                        self._offset(point, reflected),
+                        reflected,
+                        current.wavelength_nm,
+                        new_weight,
+                        seed.label,
+                    )
+                    pending.append(self._advance(state, event, outgoing, surface.identifier, state["saw_tir"], event_counter - 1))
+                else:
+                    leaves.append(self._finish(seed, state, event, "absorbed", point, None))
                 continue
 
             # The incident medium is the half-space containing the ray
