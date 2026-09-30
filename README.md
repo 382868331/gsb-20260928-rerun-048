@@ -7,10 +7,14 @@
 - 平面与球面曲面，球面半径采用沿光轴的符号约定：球心在顶点右侧为正。
 - 圆形孔径、折射面、镜面和像面/探测器。
 - 材料表与标量折射率；`Ray.wavelength_nm` 已预留，后续可替换为色散模型。
-- Snell 折射、镜面反射、全反射和非偏振 Fresnel 反射率。
-- 每次相交保存位置、法线、方向、折射率、透射/反射/吸收能量和后续方向。
-- `grazing`、`reached_image`、`no_image`、`max_events` 等光线状态均随批次保留。
+- Snell 折射、镜面反射、全反射、非偏振 Fresnel 反射率、平面分光片和孔径光阑。
+- 折射面与分光面把每束光分裂为透射和反射两条子光束，两条子光束都继续追迹；全反射只保留反射支。
+- 每条终止子光束保留来源标签、分支编号、父分支和深度，事件带全局编号避免跨分支重复记账。
+- `TraceBatch.detector_hits`、`hits_by_source`、`detector_summary` 按探测面和来源光线汇总能量与落点。
+- `TraceBatch.energy_ledger` 分别统计到达、表面吸收、孔径擦边（`grazing`）、未到达（`no_image`）以及达到事件/分支上限而停止（`max_events`、`max_branches`）的剩余能量；停止能量不计为吸收，并给出 `unaccounted` 闭合误差。
+- `TraceSettings.max_events`、`max_branches`、`min_branch_weight` 共同约束反复反射和指数分裂。
 - `Project` 与 `TraceBatch` 可保存/读取 JSON，便于工程和追迹批次重开。
+ 保存工程后用同样的输入光线重新追迹，会得到相同的分支路径、终止原因、能量和落点。
 
 ## 简化假设
 

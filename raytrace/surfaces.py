@@ -54,7 +54,7 @@ class CircularAperture:
 @dataclass(frozen=True)
 class Surface:
     identifier: str
-    kind: str  # "refract", "mirror", or "detector"
+    kind: str  # "refract", "mirror", "detector", "beamsplitter", or "aperture_stop"
     shape: str  # "plane" or "sphere"
     vertex: Vector
     axis: Vector
@@ -65,7 +65,7 @@ class Surface:
     reflectivity: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.kind not in {"refract", "mirror", "detector"}:
+        if self.kind not in {"refract", "mirror", "detector", "beamsplitter", "aperture_stop"}:
             raise ValueError(f"unsupported surface kind {self.kind!r}")
         if self.shape not in {"plane", "sphere"}:
             raise ValueError(f"unsupported surface shape {self.shape!r}")

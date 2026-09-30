@@ -72,15 +72,27 @@ class Project:
 
     def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
         tracer = RayTracer(self.surfaces, self.materials, self.settings)
-        return TraceBatch(project_name=self.name, rays=rays, results=[tracer.trace(ray) for ray in rays])
+        return TraceBatch(project_name=self.name, rays=rays, results=tracer.trace_branches(rays))
 
 
 def _ray_to_dict(ray: Ray) -> dict[str, Any]:
-    return {"origin": ray.origin, "direction": ray.direction, "wavelength_nm": ray.wavelength_nm}
+    return {
+        "origin": ray.origin,
+        "direction": ray.direction,
+        "wavelength_nm": ray.wavelength_nm,
+        "weight": ray.weight,
+        "label": ray.label,
+    }
 
 
 def _ray_from_dict(data: dict[str, Any]) -> Ray:
-    return Ray(tuple(data["origin"]), tuple(data["direction"]), data.get("wavelength_nm"))
+    return Ray(
+        tuple(data["origin"]),
+        tuple(data["direction"]),
+        data.get("wavelength_nm"),
+        data.get("weight", 1.0),
+        data.get("label"),
+    )
 
 
 @dataclass
@@ -94,6 +106,102 @@ class TraceBatch:
         for result in self.results:
             summary[result.status] = summary.get(result.status, 0) + 1
         return summary
+
+    def detector_hits(self) -> dict[str, list[dict[str, Any]]]:
+        """Terminal detector hits grouped by detector identifier."""
+
+        hits: dict[str, list[dict[str, Any]]] = {}
+        for result in self.results:
+            if result.status != "reached_image" or result.detector is None:
+                continue
+            hits.setdefault(result.detector, []).append({
+                "source_label": result.source_label,
+                "branch_id": result.branch_id,
+                "parent_branch_id": result.parent_branch_id,
+                "point": result.endpoint,
+                "power": result.weight,
+            })
+        return hits
+
+    def hits_by_source(self) -> dict[str, list[dict[str, Any]]]:
+        """Detector power and landing positions grouped by source ray."""
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for detector, hits in self.detector_hits().items():
+            for hit in hits:
+                grouped.setdefault(hit["source_label"], []).append({**hit, "detector": detector})
+        return grouped
+
+    def detector_summary(self) -> dict[str, dict[str, Any]]:
+        summaries: dict[str, dict[str, Any]] = {}
+        for detector, hits in self.detector_hits().items():
+            total_power = sum(hit["power"] for hit in hits)
+            by_source: dict[str, float] = {}
+            for hit in hits:
+                by_source[hit["source_label"]] = by_source.get(hit["source_label"], 0.0) + hit["power"]
+            summaries[detector] = {
+                "power": total_power,
+                "power_by_source": by_source,
+                "count": len(hits),
+                "mean_point": tuple(
+                    sum(hit["point"][axis] * hit["power"] for hit in hits) / total_power
+                    if total_power > 0
+                    else sum(hit["point"][axis] for hit in hits) / len(hits)
+                    for axis in range(3)
+                ),
+            }
+        return summaries
+
+    def _absorbed_by_source(self) -> dict[str, float]:
+        absorbed: dict[str, float] = {}
+        seen: set[tuple[str, int]] = set()
+        for result in self.results:
+            for event in result.events:
+                key = (result.source_label, event["event_uid"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                absorbed[result.source_label] = absorbed.get(result.source_label, 0.0) + event.get("absorbed_power", 0.0)
+        return absorbed
+
+    def energy_ledger(self, input_power: dict[str, float] | None = None) -> dict[str, dict[str, Any]]:
+        """Power account per source.
+
+        ``detected`` reached a detector, ``absorbed`` was lost on surfaces,
+        ``grazing`` remains on beams stopped at an aperture edge and
+        ``unreached``/``stopped`` are beams that escaped or hit the iteration
+        limits.  Stopped residuals are never reported as absorbed.
+        """
+
+        absorbed = self._absorbed_by_source()
+        accounts: dict[str, dict[str, Any]] = {}
+        for result in self.results:
+            account = accounts.setdefault(result.source_label, {
+                "input": 0.0,
+                "detected": 0.0,
+                "absorbed": 0.0,
+                "grazing": 0.0,
+                "unreached": 0.0,
+                "stopped": 0.0,
+            })
+            bucket = {
+                "reached_image": "detected",
+                "grazing": "grazing",
+                "no_image": "unreached",
+                "max_events": "stopped",
+                "max_branches": "stopped",
+            }.get(result.status, "stopped")
+            account[bucket] += result.weight
+
+        for source, account in accounts.items():
+            account["absorbed"] = absorbed.get(source, 0.0)
+            account["input"] = (input_power or {}).get(
+                source,
+                account["detected"] + account["absorbed"] + account["grazing"] + account["unreached"] + account["stopped"],
+            )
+            closed = account["detected"] + account["absorbed"] + account["grazing"] + account["unreached"] + account["stopped"]
+            account["unaccounted"] = account["input"] - closed
+        return accounts
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,6 +226,11 @@ class TraceBatch:
                 endpoint=tuple(item["endpoint"]),
                 weight=item["weight"],
                 events=item["events"],
+                source_label=item.get("source_label", "root"),
+                branch_id=item.get("branch_id", "root"),
+                parent_branch_id=item.get("parent_branch_id"),
+                detector=item.get("detector"),
+                depth=item.get("depth", len(item["events"])),
             )
             for item in data["results"]
         ]

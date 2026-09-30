@@ -14,6 +14,53 @@ from raytrace import (
 )
 
 
+def _combo_surfaces(materials):
+    c = math.cos(math.radians(30))
+    s = math.sin(math.radians(30))
+    wedge = (1 / math.sqrt(2), 1 / math.sqrt(2), 0.0)
+    edge_radius = 2.0 / math.sqrt(3.0)
+    return [
+        PlaneSurface(
+            "splitter",
+            (0.0, 0.0, 0.0),
+            (c, s, 0.0),
+            kind="beamsplitter",
+            aperture=CircularAperture(5.0),
+            reflectivity=0.96,
+        ),
+        PlaneSurface(
+            "clip",
+            (0.0, -2.0, 0.0),
+            (0.0, -1.0, 0.0),
+            kind="aperture_stop",
+            aperture=CircularAperture(edge_radius, edge_tolerance=1e-10),
+        ),
+        PlaneSurface(
+            "enter",
+            (2.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            kind="refract",
+            aperture=CircularAperture(5.0),
+            back_material="glass",
+        ),
+        PlaneSurface(
+            "tir",
+            (3.0, 0.0, 0.0),
+            wedge,
+            kind="refract",
+            aperture=CircularAperture(5.0),
+            front_material="glass",
+        ),
+        PlaneSurface(
+            "det_tir",
+            (3.0, -2.0, 0.0),
+            (0.0, -1.0, 0.0),
+            kind="detector",
+            aperture=CircularAperture(1.0),
+        ),
+    ]
+
+
 class RayTraceTests(unittest.TestCase):
     def setUp(self):
         self.materials = MaterialLibrary()
@@ -169,6 +216,120 @@ class RayTraceTests(unittest.TestCase):
         self.assertEqual(reopened_project.settings.max_events, 8)
         self.assertEqual(reopened_project.surfaces[0].identifier, "image")
         self.assertEqual(batch.status_summary(), reopened_batch.status_summary())
+
+    def test_beamsplitter_traces_both_children_with_lineage(self):
+        surfaces = [
+            PlaneSurface("split", (0, 0, 0), (1, 0, 0), kind="beamsplitter",
+                         aperture=CircularAperture(2.0), reflectivity=0.7),
+            PlaneSurface("det_t", (1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+            PlaneSurface("det_r", (-1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        batch = Project("split", surfaces).trace_rays([Ray((-0.5, 0, 0), (1, 0, 0), label="src")])
+        leaves = {leaf.branch_id: leaf for leaf in batch.results}
+
+        self.assertEqual(set(leaves), {"root.1.t", "root.1.r"})
+        transmitted = leaves["root.1.t"]
+        reflected = leaves["root.1.r"]
+        self.assertAlmostEqual(transmitted.weight, 0.7)
+        self.assertAlmostEqual(reflected.weight, 0.3)
+        self.assertEqual(transmitted.parent_branch_id, "root")
+        self.assertEqual(reflected.source_label, "src")
+        self.assertEqual(transmitted.events[-1]["action"], "land")
+        self.assertEqual(reflected.events[0]["action"], "split")
+        ledger = batch.energy_ledger({"src": 1.0})
+        self.assertAlmostEqual(ledger["src"]["detected"], 1.0)
+        self.assertAlmostEqual(ledger["src"]["unaccounted"], 0.0)
+
+    def test_combined_split_tir_and_aperture_grazing(self):
+        batch = Project("combo", _combo_surfaces(self.materials), self.materials).trace_rays(
+            [Ray((-2.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        )
+        by_branch = {leaf.branch_id: leaf for leaf in batch.results}
+
+        grazing = by_branch["root.1.r"]
+        self.assertEqual(grazing.status, "grazing")
+        self.assertEqual(grazing.detector, "clip")
+        self.assertAlmostEqual(grazing.weight, 0.04)
+        self.assertTrue(grazing.events[-1]["aperture_edge"])
+        self.assertAlmostEqual(grazing.endpoint[0], -2.0 / math.sqrt(3.0), places=8)
+
+        tir_leaf = by_branch["root.1.t.2.t"]
+        self.assertEqual(tir_leaf.status, "reached_image")
+        self.assertEqual(tir_leaf.detector, "det_tir")
+        self.assertAlmostEqual(tir_leaf.weight, 0.96 * 0.96, places=10)
+        self.assertEqual(tir_leaf.events[2]["action"], "total_internal_reflection")
+        self.assertEqual(tuple(round(v, 9) for v in tir_leaf.events[2]["outgoing_direction"]), (0.0, -1.0, 0.0))
+        self.assertEqual(tuple(round(v, 9) for v in tir_leaf.endpoint), (3.0, -2.0, 0.0))
+
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["detected"] + ledger["absorbed"] + ledger["grazing"]
+                               + ledger["unreached"] + ledger["stopped"], 1.0, places=9)
+        self.assertAlmostEqual(ledger["detected"], 0.9216, places=6)
+        self.assertGreaterEqual(ledger["grazing"], 0.04 - 1e-9)
+        self.assertGreater(ledger["unreached"], 0.0)
+        self.assertAlmostEqual(ledger["absorbed"], 0.0)
+        detector = batch.detector_summary()["det_tir"]
+        self.assertAlmostEqual(detector["power_by_source"]["src"], detector["power"])
+
+    def test_multiple_sources_are_grouped_independently(self):
+        surfaces = [
+            PlaneSurface("split", (0, 0, 0), (1, 0, 0), kind="beamsplitter",
+                         aperture=CircularAperture(3.0), reflectivity=0.5),
+            PlaneSurface("det_t", (1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(3.0)),
+            PlaneSurface("det_r", (-1, 0, 0), (1, 0, 0), kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        rays = [
+            Ray((-0.5, 0.2, 0), (1, 0, 0), weight=2.0, label="a"),
+            Ray((-0.5, -0.2, 0), (1, 0, 0), weight=0.5, label="b"),
+        ]
+        batch = Project("two", surfaces).trace_rays(rays)
+        hits = batch.hits_by_source()
+        self.assertEqual({hit["detector"] for hit in hits["a"]}, {"det_t", "det_r"})
+        self.assertEqual({hit["detector"] for hit in hits["b"]}, {"det_t", "det_r"})
+        ledger = batch.energy_ledger({"a": 2.0, "b": 0.5})
+        self.assertAlmostEqual(ledger["a"]["detected"], 2.0)
+        self.assertAlmostEqual(ledger["b"]["detected"], 0.5)
+
+    def test_repeated_reflection_stop_is_not_counted_as_absorbed(self):
+        surfaces = [
+            PlaneSurface("m1", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="mirror",
+                         aperture=CircularAperture(2.0), reflectivity=0.9),
+            PlaneSurface("m2", (-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="mirror",
+                         aperture=CircularAperture(2.0), reflectivity=0.9),
+        ]
+        settings = TraceSettings(max_events=10)
+        batch = Project("bounce", surfaces, self.materials, settings=settings).trace_rays(
+            [Ray((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        )
+        stopped = [leaf for leaf in batch.results if leaf.status == "max_events"]
+        self.assertTrue(stopped)
+        leaf = stopped[0]
+        self.assertEqual(leaf.depth, 10)
+        self.assertAlmostEqual(leaf.weight, 0.9**10)
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["stopped"], 0.9**10)
+        self.assertAlmostEqual(ledger["absorbed"], 1.0 - 0.9**10)
+        self.assertAlmostEqual(ledger["stopped"] + ledger["absorbed"], 1.0)
+
+    def test_saved_project_reproduces_paths_and_terminal_reasons(self):
+        project = Project("combo", _combo_surfaces(self.materials), self.materials, TraceSettings(max_events=20))
+        rays = [Ray((-2.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        batch = project.trace_rays(rays)
+
+        with tempfile.TemporaryDirectory() as directory:
+            project_path = f"{directory}/project.json"
+            project.save(project_path)
+            reopened = Project.load(project_path)
+            batch_path = f"{directory}/batch.json"
+            batch.save(batch_path)
+            recalculated = reopened.trace_rays(rays)
+
+        original = sorted((leaf.branch_id, leaf.status, leaf.detector, leaf.endpoint, leaf.weight)
+                          for leaf in batch.results)
+        repeated = sorted((leaf.branch_id, leaf.status, leaf.detector, leaf.endpoint, leaf.weight)
+                          for leaf in recalculated.results)
+        self.assertEqual(original, repeated)
+        self.assertEqual(batch.energy_ledger(), recalculated.energy_ledger())
 
 
 if __name__ == "__main__":

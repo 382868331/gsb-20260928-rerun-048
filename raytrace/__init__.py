@@ -8,7 +8,7 @@ from .surfaces import (
     SphericalSurface,
     Surface,
 )
-from .tracer import Ray, RayTracer, TraceSettings
+from .tracer import Ray, RayResult, RayTracer, TraceSettings
 
 __all__ = [
     "CircularAperture",
@@ -17,6 +17,7 @@ __all__ = [
     "PlaneSurface",
     "Project",
     "Ray",
+    "RayResult",
     "RayTracer",
     "SphericalSurface",
     "Surface",

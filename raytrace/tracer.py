@@ -1,9 +1,16 @@
-"""Sequential geometric ray tracing."""
+"""Branching geometric ray tracing.
+
+Refractive interfaces split an incoming ray into a transmitted and a
+reflected child beam.  Both children carry the remaining power of their
+parent and are traced independently; every leaf keeps its ancestry so that
+detector hits and energy accounts can be grouped by source ray.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import re
 from typing import Any
 
 from .materials import MaterialLibrary, fresnel_coefficients
@@ -15,9 +22,11 @@ class Ray:
     origin: tuple[float, float, float]
     direction: tuple[float, float, float]
     wavelength_nm: float | None = None
+    weight: float = 1.0
+    label: str | None = None
 
     def normalized(self) -> "Ray":
-        return Ray(self.origin, normalize(self.direction), self.wavelength_nm)
+        return Ray(self.origin, normalize(self.direction), self.wavelength_nm, self.weight, self.label)
 
 
 @dataclass(frozen=True)
@@ -25,6 +34,8 @@ class TraceSettings:
     max_events: int = 64
     ray_offset: float = 1e-9
     grazing_cosine: float = 1e-6
+    max_branches: int = 100_000
+    min_branch_weight: float = 1e-12
 
 
 @dataclass
@@ -34,6 +45,11 @@ class RayResult:
     endpoint: tuple[float, float, float]
     weight: float
     events: list[dict[str, Any]] = field(default_factory=list)
+    source_label: str = "root"
+    branch_id: str = "root"
+    parent_branch_id: str | None = None
+    detector: str | None = None
+    depth: int = 0
 
 
 class RayTracer:
@@ -43,23 +59,103 @@ class RayTracer:
         self.settings = settings or TraceSettings()
 
     def trace(self, ray: Ray) -> RayResult:
-        current = ray.normalized()
-        weight = 1.0
-        events: list[dict[str, Any]] = []
-        last_surface: str | None = None
-        saw_tir = False
+        leaves = self.trace_branches([ray])
+        return self._primary_leaf(ray, leaves)
 
-        for _ in range(self.settings.max_events):
-            hit = self._nearest_hit(current, last_surface)
+    @staticmethod
+    def _primary_leaf(ray: Ray, leaves: list["RayResult"]) -> RayResult:
+        """Compatibility view: the all-transmission leaf of one source ray."""
+
+        transmitted_only = re.compile(r"^root(?:\.\d+\.t)*$")
+        candidates = [leaf for leaf in leaves if transmitted_only.match(leaf.branch_id)]
+        if not candidates:
+            candidates = leaves
+        primary = max(candidates, key=lambda leaf: (leaf.depth, -len(leaf.branch_id)))
+        return RayResult(
+            ray=ray,
+            status=primary.status,
+            endpoint=primary.endpoint,
+            weight=primary.weight,
+            events=[dict(event) for event in primary.events],
+            source_label=primary.source_label,
+            branch_id=primary.branch_id,
+            parent_branch_id=primary.parent_branch_id,
+            detector=primary.detector,
+            depth=primary.depth,
+        )
+
+    def trace_branches(self, rays: list[Ray]) -> list[RayResult]:
+        """Trace every source ray and return all terminal sub-beams."""
+
+        leaves: list[RayResult] = []
+        for source_index, source_ray in enumerate(rays):
+            normalized = source_ray.normalized()
+            source_label = (
+                normalized.label
+                if normalized.label is not None
+                else f"ray-{source_index}"
+            )
+            seed = Ray(
+                normalized.origin,
+                normalized.direction,
+                normalized.wavelength_nm,
+                normalized.weight,
+                source_label,
+            )
+            leaves.extend(self._trace_one(seed))
+        return leaves
+
+    def _trace_one(self, seed: Ray) -> list[RayResult]:
+        settings = self.settings
+        pending: list[dict[str, Any]] = [
+            {
+                "ray": seed,
+                "branch_id": "root",
+                "parent_branch_id": None,
+                "depth": 0,
+                "events": [],
+                "last_surface": None,
+                "saw_tir": False,
+            }
+        ]
+        leaves: list[RayResult] = []
+        branch_count = 0
+        event_counter = 0
+
+        while pending:
+            branch_count += 1
+            if branch_count > settings.max_branches:
+                for overflow in pending:
+                    leaves.append(self._leaf(seed, overflow, "max_branches", overflow["ray"].origin))
+                break
+
+            state = pending.pop()
+            current: Ray = state["ray"]
+            weight = current.weight
+            events = state["events"]
+
+            if state["depth"] >= settings.max_events:
+                leaves.append(self._leaf(seed, state, "max_events", current.origin))
+                continue
+
+            hit = self._nearest_hit(current, state["last_surface"])
             if hit is None:
-                return RayResult(ray, "no_image", current.origin, weight, events)
+                leaves.append(self._leaf(seed, state, "no_image", current.origin))
+                continue
 
-            t, point, normal, surface = hit
+            t, point, hit_normal, surface = hit
+            # Orient the normal toward the incident half-space so reflection
+            # offsets and the Snell-geometry sign agree for both travel
+            # directions through any surface orientation.
+            normal = scale(hit_normal, -1.0 if dot(current.direction, hit_normal) > 0 else 1.0)
+            if weight < settings.min_branch_weight:
+                leaves.append(self._leaf(seed, state, "stopped", point))
+                continue
             incident = tuple(current.direction)
             edge_hit = surface.at_aperture_edge(point)
             cosine = abs(dot(current.direction, normal))
             event: dict[str, Any] = {
-                "index": len(events),
+                "event_uid": event_counter,
                 "surface": surface.identifier,
                 "kind": surface.kind,
                 "distance": t,
@@ -70,54 +166,151 @@ class RayTracer:
                 "aperture_edge": edge_hit,
             }
 
-            if edge_hit or cosine < self.settings.grazing_cosine:
+            if edge_hit or cosine < settings.grazing_cosine:
                 event.update({
                     "action": "grazing",
                     "cosine_incidence": cosine,
                     "final_direction": incident,
+                    "absorbed_power": 0.0,
                 })
-                events.append(event)
-                return RayResult(ray, "grazing", point, weight, events)
+                event["event_uid"] = event_counter
+                event_counter += 1
+                leaves.append(self._finish(seed, state, event, "grazing", point, surface.identifier))
+                continue
 
             if surface.kind == "detector":
-                event.update({"action": "land", "final_direction": incident})
-                events.append(event)
-                return RayResult(ray, "reached_image", point, weight, events)
+                event.update({
+                    "action": "land",
+                    "final_direction": incident,
+                    "absorbed_power": 0.0,
+                })
+                event["event_uid"] = event_counter
+                event_counter += 1
+                leaves.append(self._finish(seed, state, event, "reached_image", point, surface.identifier))
+                continue
+
+            if surface.kind == "aperture_stop":
+                event.update({
+                    "action": "pass_aperture",
+                    "absorbed_power": 0.0,
+                    "transmitted_power": weight,
+                    "reflected_power": 0.0,
+                    "outgoing_direction": incident,
+                    "outgoing_weight": weight,
+                })
+                event["event_uid"] = event_counter
+                event_counter += 1
+                outgoing = Ray(
+                    self._offset(point, incident),
+                    incident,
+                    current.wavelength_nm,
+                    weight,
+                    seed.label,
+                )
+                pending.append(self._advance(state, event, outgoing, surface.identifier, state["saw_tir"], event_counter - 1))
+                continue
+
+            if surface.kind == "beamsplitter":
+                reflected = self._reflect(current.direction, scale(normal, -1.0))
+                transmitted = tuple(incident)
+                reflected_fraction = 1.0 - surface.reflectivity
+                transmitted_fraction = surface.reflectivity
+                reflected_weight = weight * reflected_fraction
+                transmitted_weight = weight * transmitted_fraction
+                event.update({
+                    "action": "split",
+                    "cosine_incidence": cosine,
+                    "reflected_power": reflected_weight,
+                    "transmitted_power": transmitted_weight,
+                    "absorbed_power": 0.0,
+                    "transmitted_direction": transmitted,
+                    "reflected_direction": reflected,
+                    "outgoing_direction": transmitted,
+                    "outgoing_weight": transmitted_weight,
+                })
+                event["event_uid"] = event_counter
+                event_counter += 1
+                base_events = self._extended_events(events, event, state["branch_id"], event_counter - 1)
+                next_depth = state["depth"] + 1
+                reflected_ray = Ray(
+                    self._offset(point, reflected),
+                    reflected,
+                    current.wavelength_nm,
+                    reflected_weight,
+                    seed.label,
+                )
+                transmitted_ray = Ray(
+                    self._offset(point, transmitted),
+                    transmitted,
+                    current.wavelength_nm,
+                    transmitted_weight,
+                    seed.label,
+                )
+                common = {
+                    "last_surface": surface.identifier,
+                    "depth": next_depth,
+                    "saw_tir": state["saw_tir"],
+                }
+                pending.append({
+                    **common,
+                    "events": list(base_events),
+                    "ray": reflected_ray,
+                    "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
+                    "parent_branch_id": state["branch_id"],
+                })
+                pending.append({
+                    **common,
+                    "events": list(base_events),
+                    "ray": transmitted_ray,
+                    "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
+                    "parent_branch_id": state["branch_id"],
+                })
+                continue
 
             if surface.kind == "mirror":
-                reflected = self._reflect(current.direction, normal)
+                reflected = self._reflect(current.direction, scale(normal, -1.0))
                 absorbed = weight * (1.0 - surface.reflectivity)
                 new_weight = weight * surface.reflectivity
                 event.update({
                     "action": "reflect",
                     "cosine_incidence": cosine,
-                    "reflected_power": weight - absorbed,
+                    "reflected_power": new_weight,
                     "absorbed_power": absorbed,
                     "transmitted_power": 0.0,
                     "outgoing_direction": reflected,
                     "outgoing_weight": new_weight,
                 })
-                events.append(event)
-                current = Ray(self._offset(point, reflected), reflected, current.wavelength_nm)
-                last_surface = surface.identifier
-                weight = new_weight
+                event["event_uid"] = event_counter
+                event_counter += 1
+                outgoing = Ray(
+                    self._offset(point, reflected),
+                    reflected,
+                    current.wavelength_nm,
+                    new_weight,
+                    seed.label,
+                )
+                pending.append(self._advance(state, event, outgoing, surface.identifier, state["saw_tir"], event_counter - 1))
                 continue
 
-            traveling_along_axis = dot(current.direction, surface.axis) > 0
-            if traveling_along_axis:
-                n1_name, n2_name = surface.front_material, surface.back_material
-            else:
+            # The incident medium is the half-space containing the ray
+            # origin, not the sign of the axial direction component; this
+            # stays correct for tilted surfaces and returning beams.
+            relative = add(current.origin, scale(surface.vertex, -1.0))
+            origin_on_back_side = dot(relative, surface.axis) > 0
+            if origin_on_back_side:
                 n1_name, n2_name = surface.back_material, surface.front_material
+            else:
+                n1_name, n2_name = surface.front_material, surface.back_material
             n1 = self.materials.index(n1_name, current.wavelength_nm)
             n2 = self.materials.index(n2_name, current.wavelength_nm)
-            against_normal = scale(normal, -1.0 if dot(current.direction, normal) > 0 else 1.0)
+            # ``normal`` already points into the incident half-space.
+            against_normal = normal
             cos_i = -dot(current.direction, against_normal)
             eta = n1 / n2
             k = 1.0 - eta * eta * (1.0 - cos_i * cos_i)
 
             if k < 0:
-                reflected = self._reflect(current.direction, normal)
-                saw_tir = True
+                reflected = self._reflect(current.direction, scale(normal, -1.0))
                 event.update({
                     "action": "total_internal_reflection",
                     "n_incident": n1,
@@ -131,36 +324,127 @@ class RayTracer:
                     "outgoing_direction": reflected,
                     "outgoing_weight": weight,
                 })
-                events.append(event)
-                current = Ray(self._offset(point, reflected), reflected, current.wavelength_nm)
-                last_surface = surface.identifier
+                event["event_uid"] = event_counter
+                event_counter += 1
+                outgoing = Ray(
+                    self._offset(point, reflected),
+                    reflected,
+                    current.wavelength_nm,
+                    weight,
+                    seed.label,
+                )
+                pending.append(self._advance(state, event, outgoing, surface.identifier, True, event_counter - 1))
                 continue
 
             refracted = normalize(tuple(
                 eta * current.direction[i] + (eta * cos_i - math.sqrt(k)) * against_normal[i]
                 for i in range(3)
             ))
+            reflected = self._reflect(current.direction, scale(normal, -1.0))
             reflected_fraction, transmitted_fraction = fresnel_coefficients(n1, n2, cos_i)
-            reflected_power = weight * reflected_fraction
+            reflected_weight = weight * reflected_fraction
             transmitted_weight = weight * transmitted_fraction
-            absorbed_power = max(0.0, weight - reflected_power - transmitted_weight)
+            absorbed_power = max(0.0, weight - reflected_weight - transmitted_weight)
             event.update({
                 "action": "refract",
                 "n_incident": n1,
                 "n_transmitted": n2,
                 "cosine_incidence": cos_i,
-                "reflected_power": reflected_power,
+                "reflected_power": reflected_weight,
                 "transmitted_power": transmitted_weight,
                 "absorbed_power": absorbed_power,
+                "transmitted_direction": refracted,
+                "reflected_direction": reflected,
                 "outgoing_direction": refracted,
                 "outgoing_weight": transmitted_weight,
             })
-            events.append(event)
-            current = Ray(self._offset(point, refracted), refracted, current.wavelength_nm)
-            last_surface = surface.identifier
-            weight = transmitted_weight
 
-        return RayResult(ray, "max_events" if saw_tir else "no_image", current.origin, weight, events)
+            event["event_uid"] = event_counter
+            event_counter += 1
+            base_events = self._extended_events(events, event, state["branch_id"], event_counter - 1)
+            next_depth = state["depth"] + 1
+            common = {
+                "last_surface": surface.identifier,
+                "depth": next_depth,
+                "events": base_events,
+                "saw_tir": state["saw_tir"],
+            }
+            if reflected_weight > 0.0:
+                reflected_ray = Ray(
+                    self._offset(point, reflected),
+                    reflected,
+                    current.wavelength_nm,
+                    reflected_weight,
+                    seed.label,
+                )
+                pending.append({
+                    **common,
+                    "events": list(base_events),
+                    "ray": reflected_ray,
+                    "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
+                    "parent_branch_id": state["branch_id"],
+                })
+            transmitted_ray = Ray(
+                self._offset(point, refracted),
+                refracted,
+                current.wavelength_nm,
+                transmitted_weight,
+                seed.label,
+            )
+            pending.append({
+                **common,
+                "events": list(base_events),
+                "ray": transmitted_ray,
+                "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
+                "parent_branch_id": state["branch_id"],
+            })
+
+        return leaves
+
+    @staticmethod
+    def _extended_events(events: list[dict[str, Any]], event: dict[str, Any], branch_id: str, event_uid: int) -> list[dict[str, Any]]:
+        recorded = dict(event)
+        recorded["event_uid"] = event_uid
+        recorded["branch_id"] = branch_id
+        return [*events, recorded]
+
+    @staticmethod
+    def _advance(state: dict[str, Any], event: dict[str, Any], ray: Ray, surface_identifier: str, saw_tir: bool, event_uid: int) -> dict[str, Any]:
+        return {
+            "ray": ray,
+            "branch_id": state["branch_id"],
+            "parent_branch_id": state["parent_branch_id"],
+            "depth": state["depth"] + 1,
+            "events": RayTracer._extended_events(state["events"], event, state["branch_id"], event_uid),
+            "last_surface": surface_identifier,
+            "saw_tir": saw_tir,
+        }
+
+    @staticmethod
+    def _leaf(seed: Ray, state: dict[str, Any], status: str, endpoint, detector: str | None = None) -> RayResult:
+        return RayResult(
+            ray=seed,
+            status=status,
+            endpoint=tuple(endpoint),
+            weight=state["ray"].weight,
+            events=state["events"],
+            source_label=seed.label or "root",
+            branch_id=state["branch_id"],
+            parent_branch_id=state["parent_branch_id"],
+            detector=detector,
+            depth=state["depth"],
+        )
+
+    def _finish(self, seed: Ray, state: dict[str, Any], event: dict[str, Any], status: str, point, detector: str | None) -> RayResult:
+        advanced = self._advance(
+            state,
+            event,
+            state["ray"],
+            state["last_surface"],
+            state["saw_tir"],
+            event["event_uid"],
+        )
+        return self._leaf(seed, advanced, status, point, detector)
 
     def _nearest_hit(self, ray: Ray, last_surface: str | None):
         candidates = []
