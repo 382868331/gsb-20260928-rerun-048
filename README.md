@@ -9,7 +9,10 @@
 - 材料表与标量折射率；`Ray.wavelength_nm` 已预留，后续可替换为色散模型。
 - Snell 折射、镜面反射、全反射和非偏振 Fresnel 反射率。
 - 每次相交保存位置、法线、方向、折射率、透射/反射/吸收能量和后续方向。
-- `grazing`、`reached_image`、`no_image`、`max_events` 等光线状态均随批次保留。
+- 折射面按 Fresnel 分裂为透射与反射两支子光束，两支都会继续追迹；每支光束记录 `beam_id`、`parent_id`、`branch`（root/transmitted/reflected）与 `generation` 以保留来源关系。
+- `grazing`、`reached_image`、`no_image`、`max_events`、`min_weight`、`max_generations` 等光线状态均随批次保留。
+- `TraceBatch.energy_report()` 按探测面与来源光线汇总能量和落点，吸收、擦边、逃逸（no_image）与停止残余分别入账；`min_weight`/`max_events`/`max_generations` 停止的剩余能量计入 residual，不算作吸收。
+- 反复反射的停止条件由 `TraceSettings.min_weight`、`max_events`、`max_generations` 明确控制。
 - `Project` 与 `TraceBatch` 可保存/读取 JSON，便于工程和追迹批次重开。
 
 ## 简化假设

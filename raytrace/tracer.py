@@ -1,4 +1,4 @@
-"""Sequential geometric ray tracing."""
+"""Sequential geometric ray tracing with beam splitting."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ class TraceSettings:
     max_events: int = 64
     ray_offset: float = 1e-9
     grazing_cosine: float = 1e-6
+    min_weight: float = 1e-6
+    max_generations: int = 32
 
 
 @dataclass
@@ -36,6 +38,29 @@ class RayResult:
     events: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class BeamResult:
+    """One branch of a split ray tree.
+
+    beam_id is unique within one trace_beams call; parent_id links the beam
+    to the beam it split from (None for the root).  branch records how the
+    beam was created: "root", "transmitted" or "reflected".
+    """
+
+    beam_id: int
+    parent_id: int | None
+    branch: str
+    generation: int
+    ray: Ray
+    status: str
+    endpoint: tuple[float, float, float]
+    weight: float
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_ray_result(self) -> RayResult:
+        return RayResult(self.ray, self.status, self.endpoint, self.weight, self.events)
+
+
 class RayTracer:
     def __init__(self, surfaces: list[Surface], materials: MaterialLibrary, settings: TraceSettings | None = None):
         self.surfaces = surfaces
@@ -43,16 +68,58 @@ class RayTracer:
         self.settings = settings or TraceSettings()
 
     def trace(self, ray: Ray) -> RayResult:
-        current = ray.normalized()
-        weight = 1.0
+        """Trace only the primary (root) path, for backward compatibility."""
+        for beam in self.trace_beams(ray):
+            if beam.parent_id is None:
+                return beam.to_ray_result()
+        raise RuntimeError("trace_beams did not return a root beam")
+
+    def trace_beams(self, ray: Ray) -> list[BeamResult]:
+        """Trace a ray and every child beam split off by reflection/refraction.
+
+        Beams are returned in creation order (breadth-first).  A beam ends
+        with one of the statuses "reached_image", "no_image", "grazing",
+        "max_events", "min_weight" or "max_generations".  The residual weight
+        of beams stopped by "min_weight"/"max_events"/"max_generations" is
+        NOT absorbed energy; callers must book it separately (see
+        TraceBatch.energy_report).
+        """
+        beams: list[BeamResult] = []
+        queue: list[tuple[Ray, float, int | None, str, int]] = [(ray.normalized(), 1.0, None, "root", 0)]
+        while queue:
+            current, weight, parent_id, branch, generation = queue.pop(0)
+            beam_id = len(beams)
+            if weight < self.settings.min_weight:
+                beams.append(BeamResult(beam_id, parent_id, branch, generation, current,
+                                        "min_weight", current.origin, weight, []))
+                continue
+            if generation > self.settings.max_generations:
+                beams.append(BeamResult(beam_id, parent_id, branch, generation, current,
+                                        "max_generations", current.origin, weight, []))
+                continue
+            beam, children = self._trace_single(current, weight, beam_id, parent_id, branch, generation)
+            beams.append(beam)
+            for child_ray, child_weight, child_branch in children:
+                queue.append((child_ray, child_weight, beam_id, child_branch, generation + 1))
+        return beams
+
+    def _trace_single(self, ray: Ray, weight: float, beam_id: int,
+                      parent_id: int | None, branch: str, generation: int):
+        current = ray
         events: list[dict[str, Any]] = []
         last_surface: str | None = None
-        saw_tir = False
+        children: list[tuple[Ray, float, str]] = []
+
+        def finish(status: str, endpoint):
+            return BeamResult(beam_id, parent_id, branch, generation, ray,
+                              status, endpoint, weight, events), children
 
         for _ in range(self.settings.max_events):
+            if weight < self.settings.min_weight:
+                return finish("min_weight", current.origin)
             hit = self._nearest_hit(current, last_surface)
             if hit is None:
-                return RayResult(ray, "no_image", current.origin, weight, events)
+                return finish("no_image", current.origin)
 
             t, point, normal, surface = hit
             incident = tuple(current.direction)
@@ -77,12 +144,12 @@ class RayTracer:
                     "final_direction": incident,
                 })
                 events.append(event)
-                return RayResult(ray, "grazing", point, weight, events)
+                return finish("grazing", point)
 
             if surface.kind == "detector":
                 event.update({"action": "land", "final_direction": incident})
                 events.append(event)
-                return RayResult(ray, "reached_image", point, weight, events)
+                return finish("reached_image", point)
 
             if surface.kind == "mirror":
                 reflected = self._reflect(current.direction, normal)
@@ -117,7 +184,6 @@ class RayTracer:
 
             if k < 0:
                 reflected = self._reflect(current.direction, normal)
-                saw_tir = True
                 event.update({
                     "action": "total_internal_reflection",
                     "n_incident": n1,
@@ -140,10 +206,16 @@ class RayTracer:
                 eta * current.direction[i] + (eta * cos_i - math.sqrt(k)) * against_normal[i]
                 for i in range(3)
             ))
+            reflected_dir = self._reflect(current.direction, normal)
             reflected_fraction, transmitted_fraction = fresnel_coefficients(n1, n2, cos_i)
             reflected_power = weight * reflected_fraction
             transmitted_weight = weight * transmitted_fraction
             absorbed_power = max(0.0, weight - reflected_power - transmitted_weight)
+            children.append((
+                Ray(self._offset(point, reflected_dir), reflected_dir, current.wavelength_nm),
+                reflected_power,
+                "reflected",
+            ))
             event.update({
                 "action": "refract",
                 "n_incident": n1,
@@ -154,13 +226,14 @@ class RayTracer:
                 "absorbed_power": absorbed_power,
                 "outgoing_direction": refracted,
                 "outgoing_weight": transmitted_weight,
+                "split": True,
             })
             events.append(event)
             current = Ray(self._offset(point, refracted), refracted, current.wavelength_nm)
             last_surface = surface.identifier
             weight = transmitted_weight
 
-        return RayResult(ray, "max_events" if saw_tir else "no_image", current.origin, weight, events)
+        return finish("max_events", current.origin)
 
     def _nearest_hit(self, ray: Ray, last_surface: str | None):
         candidates = []

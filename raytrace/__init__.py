@@ -8,9 +8,10 @@ from .surfaces import (
     SphericalSurface,
     Surface,
 )
-from .tracer import Ray, RayTracer, TraceSettings
+from .tracer import BeamResult, Ray, RayTracer, TraceSettings
 
 __all__ = [
+    "BeamResult",
     "CircularAperture",
     "Material",
     "MaterialLibrary",

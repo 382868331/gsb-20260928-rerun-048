@@ -9,7 +9,7 @@ from typing import Any
 
 from .materials import MaterialLibrary
 from .surfaces import CircularAperture, SphericalSurface, PlaneSurface, Surface
-from .tracer import Ray, RayResult, RayTracer, TraceSettings
+from .tracer import BeamResult, Ray, RayResult, RayTracer, TraceSettings
 
 
 def _surface_to_dict(surface: Surface) -> dict[str, Any]:
@@ -72,7 +72,12 @@ class Project:
 
     def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
         tracer = RayTracer(self.surfaces, self.materials, self.settings)
-        return TraceBatch(project_name=self.name, rays=rays, results=[tracer.trace(ray) for ray in rays])
+        beams = [tracer.trace_beams(ray) for ray in rays]
+        results = [
+            next(beam for beam in ray_beams if beam.parent_id is None).to_ray_result()
+            for ray_beams in beams
+        ]
+        return TraceBatch(project_name=self.name, rays=rays, results=results, beams=beams)
 
 
 def _ray_to_dict(ray: Ray) -> dict[str, Any]:
@@ -83,17 +88,101 @@ def _ray_from_dict(data: dict[str, Any]) -> Ray:
     return Ray(tuple(data["origin"]), tuple(data["direction"]), data.get("wavelength_nm"))
 
 
+def _beam_to_dict(beam: BeamResult) -> dict[str, Any]:
+    return {
+        "beam_id": beam.beam_id,
+        "parent_id": beam.parent_id,
+        "branch": beam.branch,
+        "generation": beam.generation,
+        "ray": _ray_to_dict(beam.ray),
+        "status": beam.status,
+        "endpoint": beam.endpoint,
+        "weight": beam.weight,
+        "events": beam.events,
+    }
+
+
+def _beam_from_dict(data: dict[str, Any]) -> BeamResult:
+    return BeamResult(
+        beam_id=data["beam_id"],
+        parent_id=data["parent_id"],
+        branch=data["branch"],
+        generation=data["generation"],
+        ray=_ray_from_dict(data["ray"]),
+        status=data["status"],
+        endpoint=tuple(data["endpoint"]),
+        weight=data["weight"],
+        events=data["events"],
+    )
+
+
 @dataclass
 class TraceBatch:
     project_name: str
     rays: list[Ray]
     results: list[RayResult]
+    beams: list[list[BeamResult]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.beams:
+            self.beams = [
+                [BeamResult(0, None, "root", 0, result.ray, result.status,
+                            result.endpoint, result.weight, result.events)]
+                for result in self.results
+            ]
 
     def status_summary(self) -> dict[str, int]:
         summary: dict[str, int] = {}
-        for result in self.results:
-            summary[result.status] = summary.get(result.status, 0) + 1
+        for ray_beams in self.beams:
+            for beam in ray_beams:
+                summary[beam.status] = summary.get(beam.status, 0) + 1
         return summary
+
+    def energy_report(self) -> dict[str, Any]:
+        """Bookkeep every watt: detected, absorbed, residual, escaped, grazing.
+
+        Residual energy belongs to beams stopped by explicit termination
+        conditions (min_weight / max_events / max_generations) and is kept
+        separate from absorbed energy.
+        """
+        detectors: dict[str, dict[str, Any]] = {}
+        absorbed = 0.0
+        residual = 0.0
+        escaped = 0.0
+        grazing = 0.0
+        for source_index, ray_beams in enumerate(self.beams):
+            for beam in ray_beams:
+                for event in beam.events:
+                    absorbed += event.get("absorbed_power", 0.0)
+                if beam.status == "reached_image":
+                    surface_id = beam.events[-1]["surface"]
+                    entry = detectors.setdefault(surface_id, {
+                        "energy": 0.0, "hits": 0, "points": [], "by_source": {},
+                    })
+                    entry["energy"] += beam.weight
+                    entry["hits"] += 1
+                    entry["points"].append(beam.endpoint)
+                    key = str(source_index)
+                    entry["by_source"][key] = entry["by_source"].get(key, 0.0) + beam.weight
+                elif beam.status == "no_image":
+                    escaped += beam.weight
+                elif beam.status == "grazing":
+                    grazing += beam.weight
+                else:  # min_weight, max_events, max_generations
+                    residual += beam.weight
+        detected = sum(entry["energy"] for entry in detectors.values())
+        input_energy = float(len(self.rays))
+        accounted = detected + absorbed + residual + escaped + grazing
+        return {
+            "input_energy": input_energy,
+            "detected_energy": detected,
+            "detectors": detectors,
+            "absorbed_energy": absorbed,
+            "residual_energy": residual,
+            "escaped_energy": escaped,
+            "grazing_energy": grazing,
+            "unaccounted_energy": input_energy - accounted,
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +195,7 @@ class TraceBatch:
                 }
                 for result in self.results
             ],
+            "beams": [[_beam_to_dict(beam) for beam in ray_beams] for ray_beams in self.beams],
         }
 
     @classmethod
@@ -121,7 +211,9 @@ class TraceBatch:
             )
             for item in data["results"]
         ]
-        return cls(data["project_name"], rays, results)
+        beams = [[_beam_from_dict(item) for item in ray_beams]
+                 for ray_beams in data.get("beams", [])]
+        return cls(data["project_name"], rays, results, beams)
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
