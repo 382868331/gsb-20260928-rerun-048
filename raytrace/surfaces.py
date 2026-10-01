@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import math
 from typing import Optional
 
+from .materials import UnknownWavelengthError, _wavelength_key
+
 Vector = tuple[float, float, float]
 
 
@@ -64,6 +66,8 @@ class Surface:
     back_material: str = "air"
     reflectivity: float = 1.0
     transmissivity: Optional[float] = None
+    reflectivity_by_wavelength: Optional[dict[float, float]] = None
+    transmissivity_by_wavelength: Optional[dict[float, float]] = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"refract", "mirror", "detector", "beamsplitter", "aperture_stop"}:
@@ -76,11 +80,66 @@ class Surface:
             raise ValueError("reflectivity must be between 0 and 1")
         if self.transmissivity is not None and not 0.0 <= self.transmissivity <= 1.0:
             raise ValueError("transmissivity must be between 0 and 1")
+        for table_name, table in (
+            ("reflectivity", self.reflectivity_by_wavelength),
+            ("transmissivity", self.transmissivity_by_wavelength),
+        ):
+            if table is not None:
+                for wavelength, value in table.items():
+                    if not 0.0 <= float(value) <= 1.0:
+                        raise ValueError(f"{table_name} at {float(wavelength):g} nm must be between 0 and 1")
         if self.kind == "beamsplitter":
             transmission = 1.0 - self.reflectivity if self.transmissivity is None else self.transmissivity
             if self.reflectivity + transmission > 1.0 + 1e-12:
                 raise ValueError("beamsplitter reflectivity + transmissivity must not exceed 1")
+            wavelengths = set((self.reflectivity_by_wavelength or {}).keys()) | set(
+                (self.transmissivity_by_wavelength or {}).keys()
+            )
+            for wavelength in wavelengths:
+                reflected = (self.reflectivity_by_wavelength or {}).get(wavelength, self.reflectivity)
+                if self.transmissivity_by_wavelength and wavelength in self.transmissivity_by_wavelength:
+                    transmitted = self.transmissivity_by_wavelength[wavelength]
+                elif self.reflectivity_by_wavelength and wavelength in self.reflectivity_by_wavelength:
+                    transmitted = 1.0 - reflected
+                else:
+                    transmitted = self.transmission_fraction()
+                if reflected + transmitted > 1.0 + 1e-12:
+                    raise ValueError(
+                        f"beamsplitter response at {float(wavelength):g} nm must not exceed 1"
+                    )
         object.__setattr__(self, "axis", normalize(self.axis))
+
+    def spectral_response(self, wavelength_nm: float | None) -> tuple[float, float, bool]:
+        """Return ``(reflectivity, transmissivity, spectral)`` for one wavelength.
+
+        Only surfaces with explicit wavelength tables are dispersive; no
+        neighbouring value is ever substituted.  Reflectivity and
+        transmissivity may be tabulated independently: a missing
+        counterpart defaults to the lossless complement.
+        """
+
+        table_r = self.reflectivity_by_wavelength
+        table_t = self.transmissivity_by_wavelength
+        if table_r is None and table_t is None:
+            return self.reflectivity, self.transmission_fraction(), False
+        if wavelength_nm is None:
+            raise UnknownWavelengthError(
+                f"surface {self.identifier!r} has a wavelength-dependent response but the ray "
+                "carries no wavelength_nm"
+            )
+        if table_r is not None:
+            key = _wavelength_key(wavelength_nm, table_r, f"surface {self.identifier}", "reflectivity")
+            reflected = float(table_r[key])
+        else:
+            reflected = self.reflectivity
+        if table_t is not None:
+            key = _wavelength_key(wavelength_nm, table_t, f"surface {self.identifier}", "transmissivity")
+            transmitted = float(table_t[key])
+        elif self.kind == "beamsplitter":
+            transmitted = 1.0 - reflected if table_r is not None else self.transmission_fraction()
+        else:
+            transmitted = 1.0 - reflected
+        return reflected, transmitted, True
 
     def transmission_fraction(self) -> float:
         """Forward-transmitted power fraction; loss is ``1 - R - T``."""

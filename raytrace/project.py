@@ -10,7 +10,7 @@ import warnings
 
 from .materials import MaterialLibrary
 from .surfaces import CircularAperture, SphericalSurface, PlaneSurface, Surface
-from .tracer import Ray, RayResult, RayTracer, TraceSettings
+from .tracer import Beam, Ray, RayResult, RayTracer, TraceSettings
 
 
 def _surface_to_dict(surface: Surface) -> dict[str, Any]:
@@ -32,6 +32,14 @@ def _surface_from_dict(data: dict[str, Any]) -> Surface:
         "back_material": data.get("back_material", "air"),
         "reflectivity": data.get("reflectivity", 1.0),
         "transmissivity": data.get("transmissivity"),
+        "reflectivity_by_wavelength": {
+            float(wavelength): value
+            for wavelength, value in (data.get("reflectivity_by_wavelength") or {}).items()
+        } or None,
+        "transmissivity_by_wavelength": {
+            float(wavelength): value
+            for wavelength, value in (data.get("transmissivity_by_wavelength") or {}).items()
+        } or None,
     }
     if data["shape"] == "plane":
         return PlaneSurface(**common)
@@ -44,7 +52,7 @@ class Project:
     surfaces: list[Surface]
     materials: MaterialLibrary = field(default_factory=MaterialLibrary)
     settings: TraceSettings = field(default_factory=TraceSettings)
-    description: str = "Scalar-index, geometric-optics educational model"
+    description: str = "Wavelength-aware, geometric-optics educational model"
     # Current convention: ``reflectivity`` is always the reflected power
     # fraction.  Projects saved before this convention stored the forward
     # transmission fraction of a beamsplitter in ``reflectivity``; such files
@@ -111,9 +119,20 @@ class Project:
             warnings.warn(f"{path}: {note}", stacklevel=2)
         return project
 
-    def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
+    def trace_rays(self, rays: list[Ray] | list[Ray | Beam]) -> "TraceBatch":
         tracer = RayTracer(self.surfaces, self.materials, self.settings)
-        return TraceBatch(project_name=self.name, rays=rays, results=tracer.trace_branches(rays))
+        expanded = _expand_sources(rays)
+        return TraceBatch(project_name=self.name, rays=expanded, results=tracer.trace_branches(rays))
+
+
+def _expand_sources(sources) -> list[Ray]:
+    rays: list[Ray] = []
+    for source in sources:
+        if isinstance(source, Beam):
+            rays.extend(source.rays())
+        else:
+            rays.append(source)
+    return rays
 
 
 def _ray_to_dict(ray: Ray) -> dict[str, Any]:
@@ -136,6 +155,38 @@ def _ray_from_dict(data: dict[str, Any]) -> Ray:
     )
 
 
+def _wavelength_label(wavelength_nm: float | None) -> str:
+    return "broadband" if wavelength_nm is None else f"{float(wavelength_nm):g}"
+
+
+def _wavelength_sort(wavelength_nm: float | None) -> float:
+    return float("inf") if wavelength_nm is None else float(wavelength_nm)
+
+
+def _wavelength_from_label(label: str) -> float | None:
+    return None if label == "broadband" else float(label)
+
+
+def _input_lookup(input_power: dict[str, Any] | None, source: str) -> Any:
+    return None if input_power is None else input_power.get(source)
+
+
+def _wavelength_input(provided: Any, label: str, wavelength_nm: float | None, closed: float) -> float:
+    if isinstance(provided, dict):
+        if wavelength_nm is not None and wavelength_nm in provided:
+            return float(provided[wavelength_nm])
+        if label in provided:
+            return float(provided[label])
+        return closed
+    return closed
+
+
+def _source_input(provided: Any, default: float) -> float:
+    if isinstance(provided, dict):
+        return sum(float(value) for value in provided.values())
+    return default if provided is None else float(provided)
+
+
 @dataclass
 class TraceBatch:
     project_name: str
@@ -148,6 +199,16 @@ class TraceBatch:
             summary[result.status] = summary.get(result.status, 0) + 1
         return summary
 
+    def status_summary_by_wavelength(self) -> dict[str, dict[str, int]]:
+        """Terminal-reason counts kept separate for each wavelength."""
+
+        summaries: dict[str, dict[str, Any]] = {}
+        for result in self.results:
+            key = _wavelength_label(result.wavelength_nm)
+            summary = summaries.setdefault(key, {"wavelength_nm": result.wavelength_nm})
+            summary[result.status] = summary.get(result.status, 0) + 1
+        return summaries
+
     def detector_hits(self) -> dict[str, list[dict[str, Any]]]:
         """Terminal detector hits grouped by detector identifier."""
 
@@ -157,6 +218,7 @@ class TraceBatch:
                 continue
             hits.setdefault(result.detector, []).append({
                 "source_label": result.source_label,
+                "wavelength_nm": result.wavelength_nm,
                 "branch_id": result.branch_id,
                 "parent_branch_id": result.parent_branch_id,
                 "depth": result.depth,
@@ -180,11 +242,22 @@ class TraceBatch:
         for detector, hits in self.detector_hits().items():
             total_power = sum(hit["power"] for hit in hits)
             by_source: dict[str, float] = {}
+            by_wavelength: dict[str, float] = {}
+            by_source_wavelength: dict[str, dict[str, float]] = {}
+            branches_by_wavelength: dict[str, list[dict[str, Any]]] = {}
             for hit in hits:
                 by_source[hit["source_label"]] = by_source.get(hit["source_label"], 0.0) + hit["power"]
+                wavelength_key = _wavelength_label(hit["wavelength_nm"])
+                by_wavelength[wavelength_key] = by_wavelength.get(wavelength_key, 0.0) + hit["power"]
+                source_bucket = by_source_wavelength.setdefault(hit["source_label"], {})
+                source_bucket[wavelength_key] = source_bucket.get(wavelength_key, 0.0) + hit["power"]
+                branches_by_wavelength.setdefault(wavelength_key, []).append(hit)
             summaries[detector] = {
                 "power": total_power,
                 "power_by_source": by_source,
+                "power_by_wavelength": by_wavelength,
+                "power_by_source_wavelength": by_source_wavelength,
+                "branches_by_wavelength": branches_by_wavelength,
                 "count": len(hits),
                 "branches": sorted(hits, key=lambda hit: (hit["source_label"], hit["branch_id"])),
                 "mean_point": tuple(
@@ -211,6 +284,7 @@ class TraceBatch:
             for event in result.events:
                 step: dict[str, Any] = {
                     "event_uid": event["event_uid"],
+                    "wavelength_nm": event.get("wavelength_nm"),
                     "surface": event["surface"],
                     "action": event["action"],
                     "point": event["point"],
@@ -218,6 +292,8 @@ class TraceBatch:
                     "reflected_power": event.get("reflected_power", 0.0),
                     "transmitted_power": event.get("transmitted_power", 0.0),
                     "absorbed_power": event.get("absorbed_power", 0.0),
+                    "surface_absorbed_power": event.get("surface_absorbed_power", event.get("absorbed_power", 0.0)),
+                    "bulk_absorbed_power": event.get("bulk_absorbed_power", 0.0),
                 }
                 if "reflectivity" in event:
                     step["reflectivity"] = event["reflectivity"]
@@ -225,6 +301,7 @@ class TraceBatch:
                 steps.append(step)
             flows.append({
                 "source_label": result.source_label,
+                "wavelength_nm": result.wavelength_nm,
                 "branch_id": result.branch_id,
                 "parent_branch_id": result.parent_branch_id,
                 "depth": result.depth,
@@ -234,10 +311,17 @@ class TraceBatch:
                 "terminal_power": result.weight,
                 "steps": steps,
             })
-        return sorted(flows, key=lambda item: (item["source_label"], item["branch_id"]))
+        return sorted(
+            flows,
+            key=lambda item: (
+                item["source_label"],
+                _wavelength_sort(item["wavelength_nm"]),
+                item["branch_id"],
+            ),
+        )
 
-    def _absorbed_by_source(self) -> dict[str, float]:
-        absorbed: dict[str, float] = {}
+    def _losses_by_source(self) -> dict[str, dict[str, dict[str, float]]]:
+        losses: dict[str, dict[str, dict[str, float]]] = {}
         seen: set[tuple[str, int]] = set()
         for result in self.results:
             for event in result.events:
@@ -245,8 +329,20 @@ class TraceBatch:
                 if key in seen:
                     continue
                 seen.add(key)
-                absorbed[result.source_label] = absorbed.get(result.source_label, 0.0) + event.get("absorbed_power", 0.0)
-        return absorbed
+                wavelength_key = _wavelength_label(result.wavelength_nm)
+                bucket = losses.setdefault(result.source_label, {}).setdefault(
+                    wavelength_key, {"surface": 0.0, "bulk": 0.0, "absorbed": 0.0}
+                )
+                surface_loss = (
+                    event.get("surface_absorbed_power")
+                    if "surface_absorbed_power" in event
+                    else event.get("absorbed_power", 0.0) - event.get("bulk_absorbed_power", 0.0)
+                )
+                bulk_loss = event.get("bulk_absorbed_power", 0.0)
+                bucket["surface"] += surface_loss
+                bucket["bulk"] += bulk_loss
+                bucket["absorbed"] += event.get("absorbed_power", 0.0)
+        return losses
 
     def energy_ledger(self, input_power: dict[str, float] | None = None) -> dict[str, dict[str, Any]]:
         """Power account per source.
@@ -257,13 +353,28 @@ class TraceBatch:
         limits.  Stopped residuals are never reported as absorbed.
         """
 
-        absorbed = self._absorbed_by_source()
+        losses = self._losses_by_source()
         accounts: dict[str, dict[str, Any]] = {}
         for result in self.results:
             account = accounts.setdefault(result.source_label, {
                 "input": 0.0,
                 "detected": 0.0,
                 "absorbed": 0.0,
+                "grazing": 0.0,
+                "unreached": 0.0,
+                "stopped": 0.0,
+                "surface_absorbed": 0.0,
+                "bulk_absorbed": 0.0,
+                "by_wavelength": {},
+            })
+            wavelength_key = _wavelength_label(result.wavelength_nm)
+            spectral = account["by_wavelength"].setdefault(wavelength_key, {
+                "wavelength_nm": result.wavelength_nm,
+                "input": 0.0,
+                "detected": 0.0,
+                "absorbed": 0.0,
+                "surface_absorbed": 0.0,
+                "bulk_absorbed": 0.0,
                 "grazing": 0.0,
                 "unreached": 0.0,
                 "stopped": 0.0,
@@ -280,14 +391,42 @@ class TraceBatch:
             }.get(result.status, "stopped")
             if bucket is not None:
                 account[bucket] += result.weight
+                spectral[bucket] += result.weight
 
         for source, account in accounts.items():
-            account["absorbed"] = absorbed.get(source, 0.0)
-            account["input"] = (input_power or {}).get(
-                source,
-                account["detected"] + account["absorbed"] + account["grazing"] + account["unreached"] + account["stopped"],
+            for wavelength_key, loss_bucket in losses.get(source, {}).items():
+                spectral = account["by_wavelength"].setdefault(wavelength_key, {
+                    "wavelength_nm": _wavelength_from_label(wavelength_key),
+                    "input": 0.0,
+                    "detected": 0.0,
+                    "absorbed": 0.0,
+                    "surface_absorbed": 0.0,
+                    "bulk_absorbed": 0.0,
+                    "grazing": 0.0,
+                    "unreached": 0.0,
+                    "stopped": 0.0,
+                })
+                spectral["surface_absorbed"] += loss_bucket["surface"]
+                spectral["bulk_absorbed"] += loss_bucket["bulk"]
+                spectral["absorbed"] += loss_bucket["absorbed"]
+            provided = _input_lookup(input_power, source)
+            for wavelength_key, spectral in account["by_wavelength"].items():
+                closed_spectral = (
+                    spectral["detected"] + spectral["absorbed"] + spectral["grazing"]
+                    + spectral["unreached"] + spectral["stopped"]
+                )
+                spectral_input = _wavelength_input(provided, wavelength_key, spectral["wavelength_nm"], closed_spectral)
+                spectral["input"] = spectral_input
+                spectral["unaccounted"] = spectral_input - closed_spectral
+                account["surface_absorbed"] += spectral["surface_absorbed"]
+                account["bulk_absorbed"] += spectral["bulk_absorbed"]
+            account["absorbed"] = account["surface_absorbed"] + account["bulk_absorbed"]
+            default_input = (
+                account["detected"] + account["absorbed"] + account["grazing"]
+                + account["unreached"] + account["stopped"]
             )
-            closed = account["detected"] + account["absorbed"] + account["grazing"] + account["unreached"] + account["stopped"]
+            account["input"] = _source_input(provided, default_input)
+            closed = default_input
             account["unaccounted"] = account["input"] - closed
         return accounts
 
@@ -319,6 +458,7 @@ class TraceBatch:
                 parent_branch_id=item.get("parent_branch_id"),
                 detector=item.get("detector"),
                 depth=item.get("depth", len(item["events"])),
+                wavelength_nm=item.get("wavelength_nm", item["ray"].get("wavelength_nm")),
             )
             for item in data["results"]
         ]
@@ -326,6 +466,106 @@ class TraceBatch:
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def append_batch(self, other: "TraceBatch") -> "TraceBatch":
+        """Append a later wavelength run without rewriting an old batch.
+
+        The returned copy keeps every old leaf and every new leaf; frozen
+        batches on disk are therefore safe to reopen and extend.
+        """
+
+        # Event uids are only unique inside one batch; offset the appended
+        # batch while deep-copying event records so the saved old batch is
+        # left byte-for-byte untouched and ledger de-duplication still works.
+        offset = 1 + max(
+            (event["event_uid"] for result in self.results for event in result.events),
+            default=-1,
+        )
+        rays = [*self.rays, *other.rays]
+        results = [
+            *self.results,
+            *[
+                RayResult(
+                    ray=result.ray,
+                    status=result.status,
+                    endpoint=result.endpoint,
+                    weight=result.weight,
+                    events=[
+                        {**event, "event_uid": event["event_uid"] + offset}
+                        for event in result.events
+                    ],
+                    source_label=result.source_label,
+                    branch_id=result.branch_id,
+                    parent_branch_id=result.parent_branch_id,
+                    detector=result.detector,
+                    depth=result.depth,
+                    wavelength_nm=result.wavelength_nm,
+                )
+                for result in other.results
+            ],
+        ]
+        name = self.project_name if self.project_name == other.project_name else f"{self.project_name}+{other.project_name}"
+        return TraceBatch(project_name=name, rays=rays, results=results)
+
+    def detector_power_comparison(self, other: "TraceBatch") -> dict[str, dict[str, Any]]:
+        """Compare detector totals before/after a material response change.
+
+        Every detector reports total delta plus a per-wavelength delta and
+        the contributing branches on each side, so gains and losses can be
+        traced back to source, wavelength and path rather than averaged.
+        """
+
+        before = self.detector_summary()
+        after = other.detector_summary()
+        comparison: dict[str, dict[str, Any]] = {}
+        for detector in sorted(set(before) | set(after)):
+            left = before.get(detector, {"power": 0.0, "power_by_wavelength": {}, "branches": []})
+            right = after.get(detector, {"power": 0.0, "power_by_wavelength": {}, "branches": []})
+            wavelengths = sorted(
+                set(left.get("power_by_wavelength", {})) | set(right.get("power_by_wavelength", {})),
+                key=lambda label: _wavelength_from_label(label) if label != "broadband" else float("inf"),
+            )
+            comparison[detector] = {
+                "before": left["power"],
+                "after": right["power"],
+                "delta": right["power"] - left["power"],
+                "by_wavelength": {
+                    label: {
+                        "before": left["power_by_wavelength"].get(label, 0.0),
+                        "after": right["power_by_wavelength"].get(label, 0.0),
+                        "delta": right["power_by_wavelength"].get(label, 0.0) - left["power_by_wavelength"].get(label, 0.0),
+                    }
+                    for label in wavelengths
+                },
+                "branches_before": left.get("branches", []),
+                "branches_after": right.get("branches", []),
+            }
+        return comparison
+
+    def energy_ledger_comparison(self, other: "TraceBatch", input_power: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Reconcile aperture clipping and material loss separately."""
+
+        before_ledger = self.energy_ledger(input_power)
+        after_ledger = other.energy_ledger(input_power)
+        buckets = (
+            "detected",
+            "surface_absorbed",
+            "bulk_absorbed",
+            "absorbed",
+            "grazing",
+            "unreached",
+            "stopped",
+        )
+        comparison: dict[str, Any] = {}
+        for source in sorted(set(before_ledger) | set(after_ledger)):
+            left = before_ledger.get(source, {bucket: 0.0 for bucket in buckets})
+            right = after_ledger.get(source, {bucket: 0.0 for bucket in buckets})
+            comparison[source] = {
+                bucket: {"before": left.get(bucket, 0.0), "after": right.get(bucket, 0.0),
+                         "delta": right.get(bucket, 0.0) - left.get(bucket, 0.0)}
+                for bucket in buckets
+            }
+        return comparison
 
 
 def load_project(path: str | Path) -> Project:

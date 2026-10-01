@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from raytrace import (
+    Beam,
     CircularAperture,
     Material,
     MaterialLibrary,
@@ -12,7 +13,9 @@ from raytrace import (
     Project,
     Ray,
     SphericalSurface,
+    TraceBatch,
     TraceSettings,
+    UnknownWavelengthError,
 )
 
 
@@ -494,6 +497,182 @@ class RayTraceTests(unittest.TestCase):
                    + ledger_a["unreached"] + ledger_a["stopped"])
         self.assertAlmostEqual(total_a, 1.0, places=9)
         self.assertAlmostEqual(ledger_a["unaccounted"], 0.0)
+
+
+class SpectralTracingTests(unittest.TestCase):
+    def _dispersive_project(self, low_index=1.60, high_index=1.45):
+        materials = MaterialLibrary()
+        materials.add(Material(
+            "glass",
+            index_by_wavelength={450.0: low_index, 650.0: high_index},
+            loss_by_wavelength={450.0: 0.10, 650.0: 0.02},
+        ))
+        surfaces = [
+            PlaneSurface("front", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="refract",
+                          aperture=CircularAperture(2.0), back_material="glass"),
+            PlaneSurface("back", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="refract",
+                          aperture=CircularAperture(2.0), front_material="glass"),
+            PlaneSurface("image", (2.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                          kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        return Project("spectral", surfaces, materials)
+
+    def test_same_beam_keeps_independent_wavelength_branches_and_energy(self):
+        project = self._dispersive_project()
+        beam = Beam((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="beam")
+        batch = project.trace_rays([beam])
+
+        self.assertEqual({ray.wavelength_nm for ray in batch.rays}, {450.0, 650.0})
+        detected = batch.detector_summary()["image"]
+        self.assertAlmostEqual(detected["power"], detected["power_by_wavelength"]["450"]
+                               + detected["power_by_wavelength"]["650"])
+        self.assertNotAlmostEqual(
+            detected["power_by_wavelength"]["450"],
+            detected["power_by_wavelength"]["650"],
+        )
+        self.assertTrue(all(hit["wavelength_nm"] in {450.0, 650.0} for hit in detected["branches"]))
+        wavelengths_on_paths = {
+            (flow["wavelength_nm"], tuple(step["action"] for step in flow["steps"]))
+            for flow in batch.branch_energy_flow()
+        }
+        self.assertTrue(any(wavelength == 450.0 for wavelength, _ in wavelengths_on_paths))
+        self.assertTrue(any(wavelength == 650.0 for wavelength, _ in wavelengths_on_paths))
+
+        ledger = batch.energy_ledger({"beam": {450.0: 1.0, 650.0: 1.0}})["beam"]
+        by_wavelength = ledger["by_wavelength"]
+        self.assertGreater(by_wavelength["450"]["bulk_absorbed"], by_wavelength["650"]["bulk_absorbed"])
+        for spectral in by_wavelength.values():
+            self.assertAlmostEqual(spectral["unaccounted"], 0.0)
+            self.assertAlmostEqual(
+                spectral["surface_absorbed"] + spectral["bulk_absorbed"],
+                spectral["absorbed"],
+            )
+
+    def test_unknown_wavelength_is_rejected_not_interpolated(self):
+        project = self._dispersive_project()
+        with self.assertRaises(UnknownWavelengthError) as context:
+            project.trace_rays([Ray((-1, 0, 0), (1, 0, 0), wavelength_nm=550.0, label="beam")])
+        message = str(context.exception)
+        self.assertIn("550 nm", message)
+        self.assertIn("450 nm", message)
+        self.assertIn("650 nm", message)
+        self.assertIn("refusing", message)
+
+        with self.assertRaises(UnknownWavelengthError):
+            project.trace_rays([Beam((-1, 0, 0), (1, 0, 0), [550.0], label="beam")])
+
+    def test_tir_branch_is_retained_for_only_one_wavelength(self):
+        materials = MaterialLibrary()
+        materials.add(Material("glass", index_by_wavelength={450.0: 1.6, 650.0: 1.45}))
+        surfaces = [
+            PlaneSurface("exit", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="refract",
+                          aperture=CircularAperture(5.0), front_material="glass"),
+            PlaneSurface("image", (2.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                          kind="detector", aperture=CircularAperture(5.0)),
+        ]
+        project = Project("split-tir", surfaces, materials)
+        incident = (math.cos(math.radians(40.0)), math.sin(math.radians(40.0)), 0.0)
+        batch = project.trace_rays([Beam((0.1, 0.0, 0.0), incident, [450.0, 650.0], label="beam")])
+
+        terminal = {
+            (flow["wavelength_nm"], flow["branch_id"], flow["status"], flow["steps"][-1]["action"])
+            for flow in batch.branch_energy_flow()
+        }
+        self.assertIn((450.0, "root@450nm", "no_image", "total_internal_reflection"), terminal)
+        self.assertTrue(any(
+            wavelength == 650.0 and status == "reached_image" and action == "land"
+            for wavelength, _, status, action in terminal
+        ))
+        self.assertTrue(any(
+            wavelength == 650.0 and action == "refract"
+            for wavelength, _, _, action in terminal
+        ))
+
+    def test_response_change_comparison_separates_detector_gain_and_losses(self):
+        before = self._dispersive_project(low_index=1.62, high_index=1.48).trace_rays(
+            [Beam((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="beam")]
+        )
+        after = self._dispersive_project(low_index=1.60, high_index=1.45).trace_rays(
+            [Beam((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="beam")]
+        )
+        detector_delta = before.detector_power_comparison(after)["image"]
+        self.assertAlmostEqual(
+            detector_delta["delta"],
+            sum(item["delta"] for item in detector_delta["by_wavelength"].values()),
+        )
+        self.assertEqual(set(detector_delta["by_wavelength"]), {"450", "650"})
+
+        ledger_delta = before.energy_ledger_comparison(
+            after, {"beam": {450.0: 1.0, 650.0: 1.0}}
+        )["beam"]
+        self.assertIn("grazing", ledger_delta)
+        self.assertIn("bulk_absorbed", ledger_delta)
+        self.assertIn("surface_absorbed", ledger_delta)
+
+    def test_spectral_surface_responses_and_project_roundtrip(self):
+        materials = MaterialLibrary()
+        materials.add(Material("glass", index_by_wavelength={450.0: 1.6, 650.0: 1.45}))
+        surfaces = [
+            PlaneSurface("split", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="beamsplitter",
+                          aperture=CircularAperture(3.0),
+                          reflectivity_by_wavelength={450.0: 0.4, 650.0: 0.1}),
+            PlaneSurface("det_t", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                          kind="detector", aperture=CircularAperture(3.0)),
+            PlaneSurface("det_r", (-1.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                          kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        project = Project("coated", surfaces, materials)
+        beam = Beam((-0.5, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="beam")
+        batch = project.trace_rays([beam])
+
+        powers = batch.detector_summary()
+        self.assertAlmostEqual(powers["det_r"]["power_by_wavelength"]["450"], 0.4)
+        self.assertAlmostEqual(powers["det_t"]["power_by_wavelength"]["450"], 0.6)
+        self.assertAlmostEqual(powers["det_r"]["power_by_wavelength"]["650"], 0.1)
+        self.assertAlmostEqual(powers["det_t"]["power_by_wavelength"]["650"], 0.9)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/project.json"
+            project.save(path)
+            reloaded = Project.load(path)
+            recalculated = reloaded.trace_rays([beam])
+
+        self.assertEqual(batch.detector_summary(), recalculated.detector_summary())
+
+    def test_old_batch_energy_explanation_is_preserved_when_appending(self):
+        old_surfaces = [
+            PlaneSurface("image", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                          kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        old_batch = Project("old", old_surfaces).trace_rays([Ray((0, 0, 0), (1, 0, 0), label="old")])
+        materials = MaterialLibrary()
+        materials.add(Material("glass", index_by_wavelength={450.0: 1.6}))
+        spectral_surfaces = [
+            PlaneSurface("image", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="refract",
+                          aperture=CircularAperture(2.0), back_material="glass"),
+            PlaneSurface("detector", (2.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                          kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        spectral_batch = Project("new", spectral_surfaces, materials).trace_rays([
+            Beam((0, 0, 0), (1, 0, 0), [450.0], label="new")
+        ])
+        combined = old_batch.append_batch(spectral_batch)
+
+        old_leaf = next(result for result in combined.results if result.source_label == "old")
+        self.assertEqual(old_leaf.status, "reached_image")
+        self.assertEqual(old_leaf.detector, "image")
+        self.assertAlmostEqual(old_leaf.weight, 1.0)
+        self.assertEqual(old_leaf.wavelength_nm, None)
+        self.assertEqual(combined.energy_ledger({"old": 1.0})["old"]["detected"], 1.0)
+        self.assertGreater(combined.energy_ledger()["new"]["by_wavelength"]["450"]["detected"], 0.9)
+
+        with tempfile.TemporaryDirectory() as directory:
+            old_path = f"{directory}/old.json"
+            new_path = f"{directory}/combined.json"
+            old_batch.save(old_path)
+            combined.save(new_path)
+            reloaded_old = TraceBatch.from_dict(json.loads(Path(old_path).read_text(encoding="utf-8")))
+        self.assertEqual(reloaded_old.status_summary(), old_batch.status_summary())
 
 
 if __name__ == "__main__":

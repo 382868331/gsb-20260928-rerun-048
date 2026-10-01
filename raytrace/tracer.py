@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import re
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from .materials import MaterialLibrary, fresnel_coefficients
 from .surfaces import Surface, add, dot, normalize, scale
@@ -27,6 +27,39 @@ class Ray:
 
     def normalized(self) -> "Ray":
         return Ray(self.origin, normalize(self.direction), self.wavelength_nm, self.weight, self.label)
+
+
+@dataclass(frozen=True)
+class Beam:
+    """One input beam carrying several spectral components.
+
+    Each wavelength is traced as its own source ray: branches, directions,
+    energies and terminal reasons are never averaged across wavelengths.
+    """
+
+    origin: tuple[float, float, float]
+    direction: tuple[float, float, float]
+    wavelengths: Sequence[float]
+    weights: Sequence[float] | None = None
+    label: str | None = None
+
+    def rays(self) -> list[Ray]:
+        wavelengths = list(self.wavelengths)
+        if not wavelengths:
+            raise ValueError("a beam must contain at least one wavelength")
+        if len(set(float(w) for w in wavelengths)) != len(wavelengths):
+            raise ValueError("beam wavelengths must be distinct")
+        weights = [1.0] * len(wavelengths) if self.weights is None else list(self.weights)
+        if len(weights) != len(wavelengths):
+            raise ValueError("beam weights must match wavelengths one for one")
+        return [
+            Ray(self.origin, self.direction, float(wavelength), float(weight), self.label)
+            for wavelength, weight in zip(wavelengths, weights)
+        ]
+
+    @classmethod
+    def equal(cls, origin, direction, wavelengths: Sequence[float], label: str | None = None, weight: float = 1.0) -> "Beam":
+        return cls(origin, direction, list(wavelengths), [weight] * len(list(wavelengths)), label)
 
 
 @dataclass(frozen=True)
@@ -50,6 +83,7 @@ class RayResult:
     parent_branch_id: str | None = None
     detector: str | None = None
     depth: int = 0
+    wavelength_nm: float | None = None
 
 
 class RayTracer:
@@ -57,7 +91,6 @@ class RayTracer:
         self.surfaces = surfaces
         self.materials = materials
         self.settings = settings or TraceSettings()
-
     def trace(self, ray: Ray) -> RayResult:
         leaves = self.trace_branches([ray])
         return self._primary_leaf(ray, leaves)
@@ -66,7 +99,7 @@ class RayTracer:
     def _primary_leaf(ray: Ray, leaves: list["RayResult"]) -> RayResult:
         """Compatibility view: the all-transmission leaf of one source ray."""
 
-        transmitted_only = re.compile(r"^root(?:\.\d+\.t)*$")
+        transmitted_only = re.compile(r"^root(?:@[^.]+)?(?:\.\d+\.t)*$")
         candidates = [leaf for leaf in leaves if transmitted_only.match(leaf.branch_id)]
         if not candidates:
             candidates = leaves
@@ -82,13 +115,22 @@ class RayTracer:
             parent_branch_id=primary.parent_branch_id,
             detector=primary.detector,
             depth=primary.depth,
+            wavelength_nm=primary.wavelength_nm,
         )
 
-    def trace_branches(self, rays: list[Ray]) -> list[RayResult]:
-        """Trace every source ray and return all terminal sub-beams."""
+    def trace_branches(self, sources: Sequence[Ray | Beam]) -> list[RayResult]:
+        """Trace every source ray/beam and return all terminal sub-beams.
+
+        Different wavelengths of one beam are expanded into independent
+        source rays; they never merge into a single polychromatic branch.
+        Global event numbering still spans every wavelength so per-source
+        energy ledgers cannot double-count a shared event id.
+        """
 
         leaves: list[RayResult] = []
-        for source_index, source_ray in enumerate(rays):
+        seed_rays = list(_expand_sources(sources))
+        event_counter = 0
+        for source_index, source_ray in enumerate(seed_rays):
             normalized = source_ray.normalized()
             source_label = (
                 normalized.label
@@ -102,15 +144,18 @@ class RayTracer:
                 normalized.weight,
                 source_label,
             )
-            leaves.extend(self._trace_one(seed))
+            source_leaves, event_counter = self._trace_one(seed, event_counter)
+            leaves.extend(source_leaves)
         return leaves
 
-    def _trace_one(self, seed: Ray) -> list[RayResult]:
+
+    def _trace_one(self, seed: Ray, event_counter: int = 0) -> tuple[list[RayResult], int]:
         settings = self.settings
+        root_branch_id = "root" if seed.wavelength_nm is None else f"root@{float(seed.wavelength_nm):g}nm"
         pending: list[dict[str, Any]] = [
             {
                 "ray": seed,
-                "branch_id": "root",
+                "branch_id": root_branch_id,
                 "parent_branch_id": None,
                 "depth": 0,
                 "events": [],
@@ -120,14 +165,13 @@ class RayTracer:
         ]
         leaves: list[RayResult] = []
         branch_count = 0
-        event_counter = 0
 
         while pending:
             branch_count += 1
             if branch_count > settings.max_branches:
                 for overflow in pending:
                     leaves.append(self._leaf(seed, overflow, "max_branches", overflow["ray"].origin))
-                break
+                return leaves, event_counter
 
             state = pending.pop()
             current: Ray = state["ray"]
@@ -156,6 +200,7 @@ class RayTracer:
             cosine = abs(dot(current.direction, normal))
             event: dict[str, Any] = {
                 "event_uid": event_counter,
+                "wavelength_nm": current.wavelength_nm,
                 "surface": surface.identifier,
                 "kind": surface.kind,
                 "distance": t,
@@ -216,8 +261,9 @@ class RayTracer:
                 # ``reflectivity`` always means the reflected power
                 # fraction, matching mirrors; transmission defaults to the
                 # lossless complement and may be set explicitly.
-                reflected_fraction = surface.reflectivity
-                transmitted_fraction = surface.transmission_fraction()
+                reflected_fraction, transmitted_fraction, spectral_response = surface.spectral_response(
+                    current.wavelength_nm
+                )
                 reflected_weight = weight * reflected_fraction
                 transmitted_weight = weight * transmitted_fraction
                 absorbed_power = max(0.0, weight - reflected_weight - transmitted_weight)
@@ -226,6 +272,7 @@ class RayTracer:
                     "cosine_incidence": cosine,
                     "reflectivity": reflected_fraction,
                     "transmissivity": transmitted_fraction,
+                    "spectral_response": spectral_response,
                     "reflected_power": reflected_weight,
                     "transmitted_power": transmitted_weight,
                     "absorbed_power": absorbed_power,
@@ -272,11 +319,14 @@ class RayTracer:
 
             if surface.kind == "mirror":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
-                absorbed = weight * (1.0 - surface.reflectivity)
-                new_weight = weight * surface.reflectivity
+                reflected_fraction, _, spectral_response = surface.spectral_response(current.wavelength_nm)
+                absorbed = weight * (1.0 - reflected_fraction)
+                new_weight = weight * reflected_fraction
                 event.update({
                     "action": "reflect",
                     "cosine_incidence": cosine,
+                    "reflectivity": reflected_fraction,
+                    "spectral_response": spectral_response,
                     "reflected_power": new_weight,
                     "absorbed_power": absorbed,
                     "transmitted_power": 0.0,
@@ -348,9 +398,16 @@ class RayTracer:
             ))
             reflected = self._reflect(current.direction, scale(normal, -1.0))
             reflected_fraction, transmitted_fraction = fresnel_coefficients(n1, n2, cos_i)
+            # Bulk loss belongs to the medium the transmitted branch enters;
+            # it is kept separate from Fresnel/surface absorption and from
+            # aperture clipping in the energy ledger.
+            transmitted_medium = n2_name
+            bulk_loss_fraction = self.materials.loss(transmitted_medium, current.wavelength_nm)
             reflected_weight = weight * reflected_fraction
-            transmitted_weight = weight * transmitted_fraction
-            absorbed_power = max(0.0, weight - reflected_weight - transmitted_weight)
+            transmitted_weight = weight * transmitted_fraction * (1.0 - bulk_loss_fraction)
+            surface_absorbed_power = max(0.0, weight - weight * reflected_fraction - weight * transmitted_fraction)
+            bulk_absorbed_power = weight * transmitted_fraction * bulk_loss_fraction
+            absorbed_power = surface_absorbed_power + bulk_absorbed_power
             event.update({
                 "action": "refract",
                 "n_incident": n1,
@@ -359,6 +416,10 @@ class RayTracer:
                 "reflected_power": reflected_weight,
                 "transmitted_power": transmitted_weight,
                 "absorbed_power": absorbed_power,
+                "surface_absorbed_power": surface_absorbed_power,
+                "bulk_absorbed_power": bulk_absorbed_power,
+                "bulk_loss_fraction": bulk_loss_fraction,
+                "transmitted_material": transmitted_medium,
                 "transmitted_direction": refracted,
                 "reflected_direction": reflected,
                 "outgoing_direction": refracted,
@@ -405,7 +466,7 @@ class RayTracer:
                 "parent_branch_id": state["branch_id"],
             })
 
-        return leaves
+        return leaves, event_counter
 
     @staticmethod
     def _extended_events(events: list[dict[str, Any]], event: dict[str, Any], branch_id: str, event_uid: int) -> list[dict[str, Any]]:
@@ -439,6 +500,7 @@ class RayTracer:
             parent_branch_id=state["parent_branch_id"],
             detector=detector,
             depth=state["depth"],
+            wavelength_nm=seed.wavelength_nm,
         )
 
     def _finish(self, seed: Ray, state: dict[str, Any], event: dict[str, Any], status: str, point, detector: str | None) -> RayResult:
@@ -477,3 +539,13 @@ class RayTracer:
 
     def _offset(self, point, direction) -> tuple[float, float, float]:
         return add(point, scale(direction, self.settings.ray_offset))
+
+
+def _expand_sources(sources: Sequence[Ray | Beam]) -> list[Ray]:
+    rays: list[Ray] = []
+    for source in sources:
+        if isinstance(source, Beam):
+            rays.extend(source.rays())
+        else:
+            rays.append(source)
+    return rays

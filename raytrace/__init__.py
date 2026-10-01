@@ -1,6 +1,6 @@
 """Minimal geometric ray-tracing core for educational optical models."""
 
-from .materials import Material, MaterialLibrary
+from .materials import Material, MaterialLibrary, UnknownWavelengthError
 from .project import Project, TraceBatch, load_batch, load_project
 from .surfaces import (
     CircularAperture,
@@ -8,10 +8,11 @@ from .surfaces import (
     SphericalSurface,
     Surface,
 )
-from .tracer import Ray, RayResult, RayTracer, TraceSettings
+from .tracer import Beam, Ray, RayResult, RayTracer, TraceSettings
 
 __all__ = [
     "CircularAperture",
+    "Beam",
     "Material",
     "MaterialLibrary",
     "PlaneSurface",
@@ -23,6 +24,7 @@ __all__ = [
     "Surface",
     "TraceBatch",
     "TraceSettings",
+    "UnknownWavelengthError",
     "load_batch",
     "load_project",
 ]
