@@ -495,6 +495,124 @@ class RayTraceTests(unittest.TestCase):
         self.assertAlmostEqual(total_a, 1.0, places=9)
         self.assertAlmostEqual(ledger_a["unaccounted"], 0.0)
 
+    def test_spectral_ray_keeps_independent_wavelength_branches(self):
+        surfaces = [
+            PlaneSurface("enter", (2.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="refract",
+                         aperture=CircularAperture(5.0), back_material="glass"),
+            PlaneSurface("back", (3.0, 0.0, 0.0),
+                         (1.0 / math.sqrt(2.0), 1.0 / math.sqrt(2.0), 0.0),
+                         kind="refract", aperture=CircularAperture(5.0),
+                         front_material="glass"),
+            PlaneSurface("det_reflected", (3.0, -2.0, 0.0), (0.0, -1.0, 0.0),
+                         kind="detector", aperture=CircularAperture(2.0)),
+            PlaneSurface("det_transmitted", (5.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        glass = Material("glass", 1.5, {450.0: 1.5, 650.0: 1.1})
+        library = MaterialLibrary()
+        library.add(glass)
+        ray = Ray.spectral((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="src")
+        batch = Project("dispersive", surfaces, library).trace_rays([ray])
+
+        wavelengths = {leaf.wavelength_nm for leaf in batch.results}
+        self.assertEqual(wavelengths, {450.0, 650.0})
+        self.assertTrue(
+            all(leaf.branch_id.startswith("root[wavelength=450]")
+                for leaf in batch.results if leaf.wavelength_nm == 450.0)
+        )
+        tir = next(
+            leaf for leaf in batch.results
+            if leaf.wavelength_nm == 450.0
+            and any(event.get("action") == "total_internal_reflection" for event in leaf.events)
+        )
+        transmitted = next(
+            leaf for leaf in batch.results
+            if leaf.wavelength_nm == 650.0 and leaf.detector == "det_transmitted"
+        )
+        tir_event = next(event for event in tir.events if event["action"] == "total_internal_reflection")
+        transmission_event = next(event for event in transmitted.events if event["surface"] == "back")
+        self.assertEqual(tir_event["n_incident"], 1.5)
+        self.assertEqual(transmission_event["n_incident"], 1.1)
+        self.assertNotEqual(tir.branch_id, transmitted.branch_id)
+
+        summary = batch.detector_summary()
+        self.assertIn("450 nm", summary["det_reflected"]["power_by_wavelength"])
+        self.assertIn("650 nm", summary["det_transmitted"]["power_by_wavelength"])
+        self.assertIn("450 nm", summary["det_reflected"]["power_by_source_wavelength"]["src"])
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0)
+        self.assertIn("450 nm", ledger["by_wavelength"])
+        self.assertIn("650 nm", ledger["by_wavelength"])
+
+    def test_unverified_wavelength_is_marked_unknown_without_interpolation(self):
+        surfaces = [
+            PlaneSurface("enter", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="refract",
+                         aperture=CircularAperture(2.0), back_material="glass"),
+            PlaneSurface("image", (2.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        library = MaterialLibrary()
+        library.add(Material("glass", 1.5, {450.0: 1.48}))
+        ray = Ray.spectral((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="src")
+        batch = Project("strict", surfaces, library).trace_rays([ray])
+
+        unknown = [leaf for leaf in batch.results if leaf.status == "unknown_response"]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0].wavelength_nm, 650.0)
+        self.assertEqual(unknown[0].events[-1]["action"], "unknown_material_response")
+        self.assertAlmostEqual(unknown[0].weight, 0.5)
+        ledger = batch.energy_ledger({"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unknown_response"], 0.5)
+        self.assertAlmostEqual(ledger["by_wavelength"]["650 nm"]["unknown_response"], 0.5)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0)
+
+    def test_wavelength_response_comparison_keeps_loss_categories_separate(self):
+        surfaces = [
+            PlaneSurface("split", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="beamsplitter",
+                         aperture=CircularAperture(2.0), reflectivity=0.2,
+                         transmissivity=0.7),
+            PlaneSurface("enter", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0), kind="refract",
+                         aperture=CircularAperture(1.0), back_material="glass"),
+            PlaneSurface("image", (3.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        before_library = MaterialLibrary()
+        before_library.add(Material("glass", 1.5))
+        after_library = MaterialLibrary()
+        after_library.add(Material("glass", 1.5, {450.0: 1.5, 650.0: 1.1}))
+        ray = Ray.spectral((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="src")
+        before = Project("before", surfaces, before_library).trace_rays([ray])
+        after = Project("after", surfaces, after_library).trace_rays([ray])
+
+        comparison = before.compare_wavelength_response(after, {"src": 1.0})
+        self.assertIn("image", comparison["detectors"])
+        self.assertIn("650 nm", comparison["detectors"]["image"]["by_wavelength"])
+        ledger_delta = comparison["energy_ledger"]["src"]["delta"]
+        self.assertIn("material_loss", ledger_delta)
+        self.assertIn("aperture_grazing", ledger_delta)
+
+    def test_old_batch_remains_unchanged_when_wavelength_scheme_is_added(self):
+        surfaces = [
+            PlaneSurface("image", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        project = Project("archive", surfaces, self.materials)
+        old_batch = project.trace_rays([Ray((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="old")])
+        with tempfile.TemporaryDirectory() as directory:
+            old_path = Path(directory) / "old_batch.json"
+            old_batch.save(old_path)
+            reloaded_old = type(old_batch).from_dict(json.loads(old_path.read_text(encoding="utf-8")))
+            spectral_ray = Ray.spectral((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="new")
+            spectral_batch = project.trace_rays([spectral_ray])
+            new_path = Path(directory) / "wavelength_batch.json"
+            spectral_batch.save(new_path)
+
+        self.assertEqual(reloaded_old.energy_ledger(), old_batch.energy_ledger())
+        self.assertEqual(
+            [leaf.branch_id for leaf in reloaded_old.results],
+            [leaf.branch_id for leaf in old_batch.results],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

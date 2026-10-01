@@ -6,25 +6,44 @@ each ray so dispersive materials can be added without changing the tracer.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
-from typing import Dict
+from typing import Mapping
+
+
+class UnknownMaterialResponse(ValueError):
+    """Raised when a material has no verified response at a wavelength."""
 
 
 @dataclass(frozen=True)
 class Material:
     name: str
     index: float = 1.0
+    spectral_indices: Mapping[float, float] = field(default_factory=dict)
 
     def refractive_index(self, wavelength_nm: float | None = None) -> float:
         if self.index <= 0:
             raise ValueError(f"material {self.name!r} must have a positive index")
+        if wavelength_nm is not None:
+            if wavelength_nm <= 0:
+                raise ValueError("wavelength_nm must be positive")
+            spectral = dict(self.spectral_indices)
+            for value in spectral.values():
+                if value <= 0:
+                    raise ValueError(f"material {self.name!r} must have positive spectral indices")
+            if spectral:
+                try:
+                    return spectral[float(wavelength_nm)]
+                except KeyError:
+                    raise UnknownMaterialResponse(
+                        f"material {self.name!r} has no verified response at {wavelength_nm:g} nm"
+                    ) from None
         return self.index
 
 
 class MaterialLibrary:
-    def __init__(self, materials: Dict[str, Material] | None = None):
-        self.materials: Dict[str, Material] = dict(materials or {})
+    def __init__(self, materials: Mapping[str, Material] | None = None):
+        self.materials: dict[str, Material] = dict(materials or {})
         if "air" not in self.materials:
             self.add(Material("air", 1.0))
 
@@ -41,11 +60,26 @@ class MaterialLibrary:
         return self.get(name).refractive_index(wavelength_nm)
 
     def to_dict(self) -> dict:
-        return {name: vars(material) for name, material in self.materials.items()}
+        data = {}
+        for name, material in self.materials.items():
+            item = vars(material).copy()
+            item["spectral_indices"] = {
+                str(wavelength): index for wavelength, index in material.spectral_indices.items()
+            }
+            data[name] = item
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "MaterialLibrary":
-        return cls({name: Material(**values) for name, values in data.items()})
+        materials = {}
+        for name, values in data.items():
+            item = dict(values)
+            spectral = {
+                float(wavelength): float(index)
+                for wavelength, index in item.pop("spectral_indices", {}).items()
+            }
+            materials[name] = Material(spectral_indices=spectral, **item)
+        return cls(materials)
 
 
 def fresnel_coefficients(n1: float, n2: float, cos_i: float) -> tuple[float, float]:

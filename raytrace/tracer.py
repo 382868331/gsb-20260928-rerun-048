@@ -13,7 +13,7 @@ import math
 import re
 from typing import Any
 
-from .materials import MaterialLibrary, fresnel_coefficients
+from .materials import MaterialLibrary, UnknownMaterialResponse, fresnel_coefficients
 from .surfaces import Surface, add, dot, normalize, scale
 
 
@@ -24,9 +24,52 @@ class Ray:
     wavelength_nm: float | None = None
     weight: float = 1.0
     label: str | None = None
+    spectral_weights: tuple[tuple[float, float], ...] | None = None
 
     def normalized(self) -> "Ray":
-        return Ray(self.origin, normalize(self.direction), self.wavelength_nm, self.weight, self.label)
+        return Ray(
+            self.origin,
+            normalize(self.direction),
+            self.wavelength_nm,
+            self.weight,
+            self.label,
+            self.spectral_weights,
+        )
+
+    def spectral_components(self) -> tuple[tuple[float, float], ...]:
+        """Return explicit wavelength components with absolute power."""
+
+        if not self.spectral_weights:
+            return ((self.wavelength_nm, self.weight),)
+        total_fraction = sum(weight for _, weight in self.spectral_weights)
+        if total_fraction <= 0:
+            raise ValueError("spectral component weights must have a positive sum")
+        wavelengths = [wavelength for wavelength, _ in self.spectral_weights]
+        if len(set(wavelengths)) != len(wavelengths):
+            raise ValueError("spectral component wavelengths must be unique")
+        components = []
+        for wavelength, fraction in self.spectral_weights:
+            if wavelength <= 0:
+                raise ValueError("wavelength_nm must be positive")
+            if fraction < 0:
+                raise ValueError("spectral component weights must be non-negative")
+            if fraction > 0:
+                components.append((float(wavelength), self.weight * fraction / total_fraction))
+        if not components:
+            raise ValueError("a spectral ray requires at least one positive component")
+        return tuple(components)
+
+    @classmethod
+    def spectral(cls, origin, direction, wavelengths: list[float], *,
+                 fractions: list[float] | None = None, weight: float = 1.0,
+                 label: str | None = None) -> "Ray":
+        if not wavelengths:
+            raise ValueError("a spectral ray requires at least one wavelength")
+        if fractions is None:
+            fractions = [1.0 / len(wavelengths)] * len(wavelengths)
+        if len(fractions) != len(wavelengths):
+            raise ValueError("wavelengths and fractions must have the same length")
+        return cls(origin, direction, None, weight, label, tuple(zip(wavelengths, fractions)))
 
 
 @dataclass(frozen=True)
@@ -50,6 +93,7 @@ class RayResult:
     parent_branch_id: str | None = None
     detector: str | None = None
     depth: int = 0
+    wavelength_nm: float | None = None
 
 
 class RayTracer:
@@ -82,6 +126,7 @@ class RayTracer:
             parent_branch_id=primary.parent_branch_id,
             detector=primary.detector,
             depth=primary.depth,
+            wavelength_nm=primary.wavelength_nm,
         )
 
     def trace_branches(self, rays: list[Ray]) -> list[RayResult]:
@@ -95,22 +140,33 @@ class RayTracer:
                 if normalized.label is not None
                 else f"ray-{source_index}"
             )
-            seed = Ray(
-                normalized.origin,
-                normalized.direction,
-                normalized.wavelength_nm,
-                normalized.weight,
-                source_label,
-            )
-            leaves.extend(self._trace_one(seed))
+            if normalized.spectral_weights:
+                for wavelength, component_weight in normalized.spectral_components():
+                    seed = Ray(
+                        normalized.origin,
+                        normalized.direction,
+                        wavelength,
+                        component_weight,
+                        source_label,
+                    )
+                    leaves.extend(self._trace_one(seed, f"root[wavelength={wavelength:g}]"))
+            else:
+                seed = Ray(
+                    normalized.origin,
+                    normalized.direction,
+                    normalized.wavelength_nm,
+                    normalized.weight,
+                    source_label,
+                )
+                leaves.extend(self._trace_one(seed))
         return leaves
 
-    def _trace_one(self, seed: Ray) -> list[RayResult]:
+    def _trace_one(self, seed: Ray, branch_root: str = "root") -> list[RayResult]:
         settings = self.settings
         pending: list[dict[str, Any]] = [
             {
                 "ray": seed,
-                "branch_id": "root",
+                "branch_id": branch_root,
                 "parent_branch_id": None,
                 "depth": 0,
                 "events": [],
@@ -164,6 +220,7 @@ class RayTracer:
                 "incident_direction": incident,
                 "incident_weight": weight,
                 "aperture_edge": edge_hit,
+                "wavelength_nm": current.wavelength_nm,
             }
 
             if edge_hit or cosine < settings.grazing_cosine:
@@ -307,8 +364,22 @@ class RayTracer:
                 n1_name, n2_name = surface.back_material, surface.front_material
             else:
                 n1_name, n2_name = surface.front_material, surface.back_material
-            n1 = self.materials.index(n1_name, current.wavelength_nm)
-            n2 = self.materials.index(n2_name, current.wavelength_nm)
+            try:
+                n1 = self.materials.index(n1_name, current.wavelength_nm)
+                n2 = self.materials.index(n2_name, current.wavelength_nm)
+            except UnknownMaterialResponse as exc:
+                event.update({
+                    "action": "unknown_material_response",
+                    "incident_material": n1_name,
+                    "transmitted_material": n2_name,
+                    "reason": str(exc),
+                    "final_direction": incident,
+                    "absorbed_power": 0.0,
+                })
+                event["event_uid"] = event_counter
+                event_counter += 1
+                leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                continue
             # ``normal`` already points into the incident half-space.
             against_normal = normal
             cos_i = -dot(current.direction, against_normal)
@@ -439,6 +510,7 @@ class RayTracer:
             parent_branch_id=state["parent_branch_id"],
             detector=detector,
             depth=state["depth"],
+            wavelength_nm=seed.wavelength_nm,
         )
 
     def _finish(self, seed: Ray, state: dict[str, Any], event: dict[str, Any], status: str, point, detector: str | None) -> RayResult:

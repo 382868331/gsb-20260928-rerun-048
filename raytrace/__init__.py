@@ -1,6 +1,6 @@
 """Minimal geometric ray-tracing core for educational optical models."""
 
-from .materials import Material, MaterialLibrary
+from .materials import Material, MaterialLibrary, UnknownMaterialResponse
 from .project import Project, TraceBatch, load_batch, load_project
 from .surfaces import (
     CircularAperture,
@@ -23,6 +23,7 @@ __all__ = [
     "Surface",
     "TraceBatch",
     "TraceSettings",
+    "UnknownMaterialResponse",
     "load_batch",
     "load_project",
 ]
