@@ -8,7 +8,11 @@
 - 圆形孔径、折射面、镜面和像面/探测器。
 - 材料表支持标量折射率，也支持 `Material(..., spectral_indices={450: 1.5, 650: 1.48})` 这种逐波长验证响应。光谱材料只接受明确给出的精确波长；缺失响应不会使用邻近值插值或外推，而会保留为 `unknown_response` 分支。
 - 使用 `Ray.spectral(..., wavelengths=[450, 650], fractions=[...])` 可把同一输入拆成多个互相独立的波长分量。每个分量保留自己的波长、方向、能量、分支路径与终止原因，分支根使用 `root[wavelength=450]` 这类标识。
-- Snell 折射、镜面反射、全反射、非偏振 Fresnel 反射率、平面分光片和孔径光阑。
+- Snell 折射、镜面反射、全反射、逐偏振 Fresnel 反射率、非偏振兼容路径、平面分光片、分析器和孔径光阑。
+- 使用 `Ray.polarized(..., components={"s": 0.5, "p": 0.5})` 可把同一输入拆成互不相干的 s/p 偏振分量；`Ray.linear_polarized(..., electric_direction=...)` 会在首个交点按当地 s/p 基展开。分量与波长正交组合，分支根使用 `root[wavelength=450,polarization=s]`，每个分量独立携带能量、路径和来源，不会把同一输入重复加成两份。
+- 分光面可通过 `polarization_response={450: {"s": {...}, "p": {...}}}` 或 `"default"` 提供逐波长、逐偏振的 `reflectivity`/`transmissivity`；显式偏振光线遇到缺失响应时终止为 `unknown_response`，不会使用无偏振平均值冒充。
+- 表面可设置 `analyzer_axis`，或使用 `kind="analyzer"` 作为中途分析器；透过的是电场在分析轴上的功率投影，未透过能量记入 `analyzer_blocked`。旋转输入电场或分析轴会改变对应路径与探测区域。
+- `Material(..., absorption_coefficients={450: alpha})` 按传播距离计算 Beer-Lambert 体损耗；能量台账分别保留 `surface_absorption`、`volume_loss`、`aperture_grazing` 和 `analyzer_blocked`。
 - reflectivity 在所有表面类型上含义统一：始终表示反射能量比例（与镜面一致）。分光面可用 transmissivity 显式设置前向透射比例；不设置时默认透射等于 1 - reflectivity，两者之和小于 1 时差额记为表面损耗。旧工程曾把分光面的 reflectivity 字段存成前向透射比例；加载这类无 convention 标记（或标记为 legacy-beamsplitter-reflectivity-is-transmission）的工程时会自动迁移为 reflectivity 与 transmissivity 两个物理量、发出警告并在 Project.migration_notes 中记录，原实验的前向/后向能量解释保持不变。
 - 折射面与分光面把每束光分裂为透射和反射两条子光束，两条子光束都继续追迹；全反射只保留反射支。
 - 每条终止子光束保留来源标签、分支编号、父分支和深度，事件带全局编号避免跨分支重复记账。
@@ -22,7 +26,7 @@
 
 ## 简化假设
 
-当前模型只描述理想化几何光线：表面无限薄且局部光滑，材料使用各向同性标量折射率，透镜厚度由两个表面之间的传播隐式给出。模型不含真实制造所需的像差拟合、色散、镀膜、公差、散射、偏振传播、衍射、体积吸收、非球面或精确孔径装配。
+当前模型只描述理想化几何光线：表面无限薄且局部光滑，材料使用各向同性标量折射率，透镜厚度由两个表面之间的传播隐式给出。模型支持互不相关的线偏振 s/p 分量、逐偏振 Fresnel 和显式分析器，但不描述相干叠加、Jones 相位、退偏、双折射、像差拟合、公差、散射、衍射、非球面或精确孔径装配。
 
 因此它适合检查方向、交点、全反射和能量账，不应宣称结果可直接用于制造镜头。成像质量分析可在后续批次中基于落点、焦斑尺寸、RMS 弥散和光路数据扩展。
 

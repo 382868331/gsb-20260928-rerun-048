@@ -32,6 +32,8 @@ def _surface_from_dict(data: dict[str, Any]) -> Surface:
         "back_material": data.get("back_material", "air"),
         "reflectivity": data.get("reflectivity", 1.0),
         "transmissivity": data.get("transmissivity"),
+        "analyzer_axis": tuple(data["analyzer_axis"]) if data.get("analyzer_axis") else None,
+        "polarization_response": data.get("polarization_response"),
     }
     if data["shape"] == "plane":
         return PlaneSurface(**common)
@@ -124,6 +126,9 @@ def _ray_to_dict(ray: Ray) -> dict[str, Any]:
         "weight": ray.weight,
         "label": ray.label,
         "spectral_weights": list(ray.spectral_weights) if ray.spectral_weights else None,
+        "polarization": ray.polarization,
+        "polarization_weights": list(ray.polarization_weights) if ray.polarization_weights else None,
+        "electric_direction": ray.electric_direction,
     }
 
 
@@ -135,6 +140,9 @@ def _ray_from_dict(data: dict[str, Any]) -> Ray:
         data.get("weight", 1.0),
         data.get("label"),
         tuple(tuple(item) for item in data["spectral_weights"]) if data.get("spectral_weights") else None,
+        data.get("polarization"),
+        tuple(tuple(item) for item in data["polarization_weights"]) if data.get("polarization_weights") else None,
+        tuple(data["electric_direction"]) if data.get("electric_direction") else None,
     )
 
 
@@ -146,6 +154,10 @@ def _add_power(groups: dict[str, dict[str, float]], source: str, wavelength_nm: 
     groups.setdefault(source, {})
     key = _wavelength_key(wavelength_nm)
     groups[source][key] = groups[source].get(key, 0.0) + power
+
+
+def _polarization_key(polarization: str | None) -> str:
+    return "unpolarized" if polarization is None else polarization
 
 
 @dataclass
@@ -176,6 +188,7 @@ class TraceBatch:
                 "point": result.endpoint,
                 "power": result.weight,
                 "wavelength_nm": result.wavelength_nm,
+                "polarization": result.polarization,
             })
         return hits
 
@@ -194,20 +207,32 @@ class TraceBatch:
             total_power = sum(hit["power"] for hit in hits)
             by_source: dict[str, float] = {}
             by_wavelength: dict[str, float] = {}
+            by_polarization: dict[str, float] = {}
             by_source_wavelength: dict[str, dict[str, float]] = {}
+            by_source_polarization: dict[str, dict[str, float]] = {}
             for hit in hits:
                 by_source[hit["source_label"]] = by_source.get(hit["source_label"], 0.0) + hit["power"]
                 wavelength_key = _wavelength_key(hit["wavelength_nm"])
+                polarization_key = _polarization_key(hit.get("polarization"))
                 by_wavelength[wavelength_key] = by_wavelength.get(wavelength_key, 0.0) + hit["power"]
+                by_polarization[polarization_key] = (
+                    by_polarization.get(polarization_key, 0.0) + hit["power"]
+                )
                 by_source_wavelength.setdefault(hit["source_label"], {})
                 by_source_wavelength[hit["source_label"]][wavelength_key] = (
                     by_source_wavelength[hit["source_label"]].get(wavelength_key, 0.0) + hit["power"]
+                )
+                by_source_polarization.setdefault(hit["source_label"], {})
+                by_source_polarization[hit["source_label"]][polarization_key] = (
+                    by_source_polarization[hit["source_label"]].get(polarization_key, 0.0) + hit["power"]
                 )
             summaries[detector] = {
                 "power": total_power,
                 "power_by_source": by_source,
                 "power_by_wavelength": by_wavelength,
+                "power_by_polarization": by_polarization,
                 "power_by_source_wavelength": by_source_wavelength,
+                "power_by_source_polarization": by_source_polarization,
                 "count": len(hits),
                 "branches": sorted(hits, key=lambda hit: (hit["source_label"], hit["branch_id"])),
                 "mean_point": tuple(
@@ -241,6 +266,8 @@ class TraceBatch:
                     "reflected_power": event.get("reflected_power", 0.0),
                     "transmitted_power": event.get("transmitted_power", 0.0),
                     "absorbed_power": event.get("absorbed_power", 0.0),
+                    "volume_loss_power": event.get("volume_loss_power", 0.0),
+                    "analyzer_rejected_power": event.get("analyzer_rejected_power", 0.0),
                 }
                 if "reflectivity" in event:
                     step["reflectivity"] = event["reflectivity"]
@@ -256,39 +283,90 @@ class TraceBatch:
                 "endpoint": result.endpoint,
                 "terminal_power": result.weight,
                 "wavelength_nm": result.wavelength_nm,
+                "polarization": result.polarization,
                 "steps": steps,
             })
         return sorted(flows, key=lambda item: (
             item["source_label"],
             -1.0 if item["wavelength_nm"] is None else item["wavelength_nm"],
+            str(item.get("polarization")),
             item["branch_id"],
         ))
 
     def _absorbed_by_source(self) -> dict[str, float]:
-        absorbed: dict[str, float] = {}
-        seen: set[tuple[str, float | None, int]] = set()
+        absorbed: dict[str, dict[str, float]] = {}
+        seen: set[tuple[str, float | None, str | None, str, int]] = set()
         for result in self.results:
             for event in result.events:
-                key = (result.source_label, result.wavelength_nm, event["event_uid"])
+                key = (
+                    result.source_label,
+                    result.wavelength_nm,
+                    result.polarization,
+                    result.branch_id.split(".", 1)[0],
+                    event["event_uid"],
+                )
                 if key in seen:
                     continue
                 seen.add(key)
-                absorbed[result.source_label] = absorbed.get(result.source_label, 0.0) + event.get("absorbed_power", 0.0)
+                account = absorbed.setdefault(result.source_label, {"surface": 0.0, "volume": 0.0, "analyzer": 0.0})
+                account["surface"] += event.get("absorbed_power", 0.0)
+                account["volume"] += event.get("volume_loss_power", 0.0)
+                account["analyzer"] += event.get("analyzer_rejected_power", 0.0)
         return absorbed
 
-    def _absorbed_by_source_wavelength(self) -> dict[str, dict[str, float]]:
-        absorbed: dict[str, dict[str, float]] = {}
-        seen: set[tuple[str, float | None, int]] = set()
+    def _losses_by_source_wavelength_polarization(self):
+        absorbed: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
+        seen: set[tuple[str, float | None, str | None, str, int]] = set()
         for result in self.results:
             for event in result.events:
-                key = (result.source_label, result.wavelength_nm, event["event_uid"])
+                key = (
+                    result.source_label,
+                    result.wavelength_nm,
+                    result.polarization,
+                    result.branch_id.split(".", 1)[0],
+                    event["event_uid"],
+                )
                 if key in seen:
                     continue
                 seen.add(key)
-                power = event.get("absorbed_power", 0.0)
-                if power:
-                    _add_power(absorbed, result.source_label, result.wavelength_nm, power)
+                account = (
+                    absorbed.setdefault(result.source_label, {})
+                    .setdefault(_wavelength_key(result.wavelength_nm), {})
+                    .setdefault(_polarization_key(result.polarization), {
+                        "surface": 0.0,
+                        "volume": 0.0,
+                        "analyzer": 0.0,
+                    })
+                )
+                account["surface"] += event.get("absorbed_power", 0.0)
+                account["volume"] += event.get("volume_loss_power", 0.0)
+                account["analyzer"] += event.get("analyzer_rejected_power", 0.0)
         return absorbed
+
+    def _initial_inputs_by_source_wavelength_polarization(self):
+        roots: dict[tuple[str, float | None, str | None, str], float] = {}
+        for result in self.results:
+            root_branch = result.branch_id.split(".", 1)[0]
+            key = (result.source_label, result.wavelength_nm, result.polarization, root_branch)
+            if result.events:
+                first_event = result.events[0]
+                initial_power = (
+                    first_event.get("incident_weight", result.weight)
+                    + first_event.get("volume_loss_power", 0.0)
+                )
+            else:
+                initial_power = result.weight
+            roots[key] = max(roots.get(key, 0.0), initial_power)
+
+        inputs: dict[str, dict[str, dict[str, float]]] = {}
+        for (source, wavelength, polarization, _root), power in roots.items():
+            wavelength_key = _wavelength_key(wavelength)
+            polarization_key = _polarization_key(polarization)
+            inputs.setdefault(source, {}).setdefault(wavelength_key, {})
+            inputs[source][wavelength_key][polarization_key] = (
+                inputs[source][wavelength_key].get(polarization_key, 0.0) + power
+            )
+        return inputs
 
     def energy_ledger(self, input_power: dict[str, float] | None = None) -> dict[str, dict[str, Any]]:
         """Power account per source.
@@ -299,21 +377,25 @@ class TraceBatch:
         limits.  Stopped residuals are never reported as absorbed.
         """
 
-        absorbed = self._absorbed_by_source()
-        absorbed_by_wavelength = self._absorbed_by_source_wavelength()
+        absorbed_detail = self._absorbed_by_source()
+        losses = self._losses_by_source_wavelength_polarization()
         accounts: dict[str, dict[str, Any]] = {}
         for result in self.results:
             accounts.setdefault(result.source_label, {
                 "input": 0.0,
                 "detected": 0.0,
                 "absorbed": 0.0,
+                "surface_absorption": 0.0,
                 "material_loss": 0.0,
+                "volume_loss": 0.0,
                 "grazing": 0.0,
                 "aperture_grazing": 0.0,
+                "analyzer_blocked": 0.0,
                 "unreached": 0.0,
                 "stopped": 0.0,
                 "unknown_response": 0.0,
                 "by_wavelength": {},
+                "by_polarization": {},
             })
             account = accounts[result.source_label]
             wavelength_account = account["by_wavelength"].setdefault(
@@ -322,11 +404,15 @@ class TraceBatch:
                     "input": 0.0,
                     "detected": 0.0,
                     "absorbed": 0.0,
+                    "surface_absorption": 0.0,
                     "material_loss": 0.0,
+                    "volume_loss": 0.0,
                     "grazing": 0.0,
+                    "analyzer_blocked": 0.0,
                     "unreached": 0.0,
                     "stopped": 0.0,
                     "unknown_response": 0.0,
+                    "by_polarization": {},
                 },
             )
             bucket = {
@@ -336,6 +422,7 @@ class TraceBatch:
                 "max_events": "stopped",
                 "max_branches": "stopped",
                 "unknown_response": "unknown_response",
+                "analyzer_blocked": "analyzer_blocked",
                 # A leaf terminated by a fully absorbing surface: its power
                 # is already booked as surface absorption below.
                 "absorbed": None,
@@ -343,32 +430,100 @@ class TraceBatch:
             if bucket is not None:
                 account[bucket] += result.weight
                 wavelength_account[bucket] += result.weight
-            wavelength_account["input"] += result.weight
+                polarization_key = _polarization_key(result.polarization)
+                polarization_account = account["by_polarization"].setdefault(polarization_key, {
+                    "input": 0.0, "detected": 0.0, "absorbed": 0.0,
+                    "surface_absorption": 0.0, "material_loss": 0.0, "volume_loss": 0.0,
+                    "grazing": 0.0, "aperture_grazing": 0.0, "analyzer_blocked": 0.0,
+                    "unreached": 0.0, "stopped": 0.0, "unknown_response": 0.0,
+                })
+                polarization_account[bucket] += result.weight
+                polarization_account["input"] += result.weight
+                wavelength_pol_account = wavelength_account["by_polarization"].setdefault(polarization_key, {
+                    "input": 0.0, "detected": 0.0, "absorbed": 0.0,
+                    "surface_absorption": 0.0, "material_loss": 0.0, "volume_loss": 0.0,
+                    "grazing": 0.0, "aperture_grazing": 0.0, "analyzer_blocked": 0.0,
+                    "unreached": 0.0, "stopped": 0.0, "unknown_response": 0.0,
+                })
+                wavelength_pol_account[bucket] += result.weight
 
         for source, account in accounts.items():
-            account["absorbed"] = absorbed.get(source, 0.0)
-            account["material_loss"] = account["absorbed"]
+            initial_inputs = self._initial_inputs_by_source_wavelength_polarization().get(source, {})
+            detail = absorbed_detail.get(source, {"surface": 0.0, "volume": 0.0, "analyzer": 0.0})
+            account["surface_absorption"] = detail["surface"]
+            account["volume_loss"] = detail["volume"]
+            account["absorbed"] = account["surface_absorption"] + account["volume_loss"]
+            account["material_loss"] = account["volume_loss"]
             account["aperture_grazing"] = account["grazing"]
             for key, wavelength_account in account["by_wavelength"].items():
-                wavelength_account["absorbed"] = absorbed_by_wavelength.get(source, {}).get(key, 0.0)
-                wavelength_account["material_loss"] = wavelength_account["absorbed"]
+                wavelength_input = initial_inputs.get(key, {})
+                wavelength_account["input"] = sum(wavelength_input.values())
+                wavelength_detail = {"surface": 0.0, "volume": 0.0, "analyzer": 0.0}
+                for pol_detail in losses.get(source, {}).get(key, {}).values():
+                    for category in wavelength_detail:
+                        wavelength_detail[category] = wavelength_detail[category] + pol_detail[category]
+                wavelength_account["surface_absorption"] = wavelength_detail["surface"]
+                wavelength_account["volume_loss"] = wavelength_detail["volume"]
+                wavelength_account["absorbed"] = wavelength_detail["surface"] + wavelength_detail["volume"]
+                wavelength_account["material_loss"] = wavelength_detail["volume"]
+                wavelength_account["aperture_grazing"] = wavelength_account["grazing"]
+                for pol_key, pol_account in wavelength_account["by_polarization"].items():
+                    pol_account["input"] = wavelength_input.get(pol_key, 0.0)
+                    detail = losses.get(source, {}).get(key, {}).get(
+                        pol_key, {"surface": 0.0, "volume": 0.0, "analyzer": 0.0}
+                    )
+                    pol_account["surface_absorption"] = detail["surface"]
+                    pol_account["volume_loss"] = detail["volume"]
+                    pol_account["absorbed"] = detail["surface"] + detail["volume"]
+                    pol_account["material_loss"] = detail["volume"]
+                    pol_account["aperture_grazing"] = pol_account["grazing"]
+                    closed_pol = (
+                        pol_account["detected"] + pol_account["absorbed"] + pol_account["grazing"]
+                        + pol_account["analyzer_blocked"] + pol_account["unreached"]
+                        + pol_account["stopped"] + pol_account["unknown_response"]
+                    )
+                    pol_account["unaccounted"] = pol_account["input"] - closed_pol
                 wavelength_closed = (
                     wavelength_account["detected"]
                     + wavelength_account["absorbed"]
                     + wavelength_account["grazing"]
+                    + wavelength_account["analyzer_blocked"]
                     + wavelength_account["unreached"]
                     + wavelength_account["stopped"]
                     + wavelength_account["unknown_response"]
                 )
                 wavelength_account["unaccounted"] = wavelength_account["input"] - wavelength_closed
-            account["input"] = (input_power or {}).get(
-                source,
-                account["detected"] + account["absorbed"] + account["grazing"]
-                + account["unreached"] + account["stopped"] + account["unknown_response"],
+            for pol_key, pol_account in account["by_polarization"].items():
+                pol_account["input"] = sum(
+                    wavelength_inputs.get(pol_key, 0.0)
+                    for wavelength_inputs in initial_inputs.values()
+                )
+                pol_detail = {"surface": 0.0, "volume": 0.0, "analyzer": 0.0}
+                for wavelength_detail in losses.get(source, {}).values():
+                    detail = wavelength_detail.get(pol_key)
+                    if detail:
+                        for category in pol_detail:
+                            pol_detail[category] = pol_detail[category] + detail[category]
+                pol_account["surface_absorption"] = pol_detail["surface"]
+                pol_account["volume_loss"] = pol_detail["volume"]
+                pol_account["absorbed"] = pol_detail["surface"] + pol_detail["volume"]
+                pol_account["material_loss"] = pol_detail["volume"]
+                pol_account["aperture_grazing"] = pol_account["grazing"]
+                closed_pol = (
+                    pol_account["detected"] + pol_account["absorbed"] + pol_account["grazing"]
+                    + pol_account["analyzer_blocked"] + pol_account["unreached"]
+                    + pol_account["stopped"] + pol_account["unknown_response"]
+                )
+                pol_account["unaccounted"] = pol_account["input"] - closed_pol
+            inferred_input = sum(
+                sum(wavelength_inputs.values())
+                for wavelength_inputs in initial_inputs.values()
             )
+            account["input"] = (input_power or {}).get(source, inferred_input)
             closed = (
                 account["detected"] + account["absorbed"] + account["grazing"]
-                + account["unreached"] + account["stopped"] + account["unknown_response"]
+                + account["analyzer_blocked"] + account["unreached"]
+                + account["stopped"] + account["unknown_response"]
             )
             account["unaccounted"] = account["input"] - closed
         return accounts
@@ -424,6 +579,9 @@ class TraceBatch:
             "detected",
             "absorbed",
             "material_loss",
+            "surface_absorption",
+            "volume_loss",
+            "analyzer_blocked",
             "grazing",
             "aperture_grazing",
             "unreached",
@@ -484,6 +642,7 @@ class TraceBatch:
                 detector=item.get("detector"),
                 depth=item.get("depth", len(item["events"])),
                 wavelength_nm=item.get("wavelength_nm", item["ray"].get("wavelength_nm")),
+                polarization=item.get("polarization", item["ray"].get("polarization")),
             )
             for item in data["results"]
         ]

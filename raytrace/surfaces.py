@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Optional
+from typing import Mapping, Optional
 
 Vector = tuple[float, float, float]
+
+
+def cross(a: Vector, b: Vector) -> Vector:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
 
 
 def dot(a: Vector, b: Vector) -> float:
@@ -54,7 +62,7 @@ class CircularAperture:
 @dataclass(frozen=True)
 class Surface:
     identifier: str
-    kind: str  # "refract", "mirror", "detector", "beamsplitter", or "aperture_stop"
+    kind: str  # "refract", "mirror", "detector", "beamsplitter", "analyzer", or "aperture_stop"
     shape: str  # "plane" or "sphere"
     vertex: Vector
     axis: Vector
@@ -64,9 +72,12 @@ class Surface:
     back_material: str = "air"
     reflectivity: float = 1.0
     transmissivity: Optional[float] = None
+    analyzer_axis: Optional[Vector] = None
+    # {wavelength or "default": {"s": {"reflectivity": ..., "transmissivity": ...}, ...}}
+    polarization_response: Optional[Mapping[object, Mapping[str, Mapping[str, float]]]] = None
 
     def __post_init__(self) -> None:
-        if self.kind not in {"refract", "mirror", "detector", "beamsplitter", "aperture_stop"}:
+        if self.kind not in {"refract", "mirror", "detector", "beamsplitter", "analyzer", "aperture_stop"}:
             raise ValueError(f"unsupported surface kind {self.kind!r}")
         if self.shape not in {"plane", "sphere"}:
             raise ValueError(f"unsupported surface shape {self.shape!r}")
@@ -76,11 +87,66 @@ class Surface:
             raise ValueError("reflectivity must be between 0 and 1")
         if self.transmissivity is not None and not 0.0 <= self.transmissivity <= 1.0:
             raise ValueError("transmissivity must be between 0 and 1")
+        if self.analyzer_axis is not None and norm(self.analyzer_axis) == 0.0:
+            raise ValueError("analyzer axis must not be a zero vector")
+        if self.polarization_response is not None:
+            normalized_response = {}
+            for wavelength_key, wavelength_responses in self.polarization_response.items():
+                if wavelength_key != "default":
+                    try:
+                        wavelength_key = float(wavelength_key)
+                    except (TypeError, ValueError):
+                        raise ValueError("polarization response wavelength keys must be numbers or 'default'")
+                normalized_response[wavelength_key] = {
+                    channel: dict(response) for channel, response in wavelength_responses.items()
+                }
+            object.__setattr__(self, "polarization_response", normalized_response)
+            for wavelength_responses in normalized_response.values():
+                for channel, response in wavelength_responses.items():
+                    if channel not in {"s", "p"}:
+                        raise ValueError("polarization channels must be 's' or 'p'")
+                    reflected = float(response.get("reflectivity", 0.0))
+                    transmitted = float(response.get("transmissivity", 1.0 - reflected))
+                    if not 0.0 <= reflected <= 1.0 or not 0.0 <= transmitted <= 1.0:
+                        raise ValueError("polarized response fractions must be between 0 and 1")
+                    if reflected + transmitted > 1.0 + 1e-12:
+                        raise ValueError("polarized reflectivity + transmissivity must not exceed 1")
         if self.kind == "beamsplitter":
             transmission = 1.0 - self.reflectivity if self.transmissivity is None else self.transmissivity
             if self.reflectivity + transmission > 1.0 + 1e-12:
                 raise ValueError("beamsplitter reflectivity + transmissivity must not exceed 1")
         object.__setattr__(self, "axis", normalize(self.axis))
+        if self.analyzer_axis is not None:
+            object.__setattr__(self, "analyzer_axis", normalize(self.analyzer_axis))
+
+    def polarized_fractions(
+        self,
+        polarization: str,
+        wavelength_nm: float | None,
+    ) -> tuple[float, float]:
+        """Return explicitly measured (R, T) for one channel and wavelength."""
+
+        if polarization not in {"s", "p"}:
+            raise ValueError(f"unsupported polarization channel {polarization!r}")
+        if self.polarization_response is None:
+            from .materials import UnknownPolarizationResponse
+
+            raise UnknownPolarizationResponse(
+                f"surface {self.identifier!r} has no polarization-specific response"
+            )
+        wavelength_key: object = wavelength_nm if wavelength_nm in self.polarization_response else "default"
+        responses = self.polarization_response.get(wavelength_key)
+        if responses is None or polarization not in responses:
+            from .materials import UnknownPolarizationResponse
+
+            wavelength_text = "default" if wavelength_nm is None else f"{wavelength_nm:g} nm"
+            raise UnknownPolarizationResponse(
+                f"surface {self.identifier!r} has no {polarization} response at {wavelength_text}"
+            )
+        response = responses[polarization]
+        reflected = float(response.get("reflectivity", 0.0))
+        transmitted = float(response.get("transmissivity", 1.0 - reflected))
+        return reflected, transmitted
 
     def transmission_fraction(self) -> float:
         """Forward-transmitted power fraction; loss is ``1 - R - T``."""

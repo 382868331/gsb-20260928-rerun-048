@@ -15,11 +15,16 @@ class UnknownMaterialResponse(ValueError):
     """Raised when a material has no verified response at a wavelength."""
 
 
+class UnknownPolarizationResponse(ValueError):
+    """Raised when a surface has no verified response for a polarization channel."""
+
+
 @dataclass(frozen=True)
 class Material:
     name: str
     index: float = 1.0
     spectral_indices: Mapping[float, float] = field(default_factory=dict)
+    absorption_coefficients: Mapping[float, float] = field(default_factory=dict)
 
     def refractive_index(self, wavelength_nm: float | None = None) -> float:
         if self.index <= 0:
@@ -39,6 +44,26 @@ class Material:
                         f"material {self.name!r} has no verified response at {wavelength_nm:g} nm"
                     ) from None
         return self.index
+
+    def absorption_coefficient(self, wavelength_nm: float | None = None) -> float:
+        """Return the verified Napierian volume absorption coefficient."""
+
+        coefficients = dict(self.absorption_coefficients)
+        for value in coefficients.values():
+            if value < 0:
+                raise ValueError(f"material {self.name!r} cannot have negative absorption")
+        if not coefficients:
+            return 0.0
+        if wavelength_nm is None:
+            raise UnknownMaterialResponse(
+                f"material {self.name!r} has wavelength-dependent volume absorption but no wavelength was supplied"
+            )
+        try:
+            return float(coefficients[float(wavelength_nm)])
+        except KeyError:
+            raise UnknownMaterialResponse(
+                f"material {self.name!r} has no verified volume absorption at {wavelength_nm:g} nm"
+            ) from None
 
 
 class MaterialLibrary:
@@ -66,6 +91,10 @@ class MaterialLibrary:
             item["spectral_indices"] = {
                 str(wavelength): index for wavelength, index in material.spectral_indices.items()
             }
+            item["absorption_coefficients"] = {
+                str(wavelength): coefficient
+                for wavelength, coefficient in material.absorption_coefficients.items()
+            }
             data[name] = item
         return data
 
@@ -78,15 +107,23 @@ class MaterialLibrary:
                 float(wavelength): float(index)
                 for wavelength, index in item.pop("spectral_indices", {}).items()
             }
-            materials[name] = Material(spectral_indices=spectral, **item)
+            absorption = {
+                float(wavelength): float(coefficient)
+                for wavelength, coefficient in item.pop("absorption_coefficients", {}).items()
+            }
+            materials[name] = Material(
+                spectral_indices=spectral,
+                absorption_coefficients=absorption,
+                **item,
+            )
         return cls(materials)
 
 
-def fresnel_coefficients(n1: float, n2: float, cos_i: float) -> tuple[float, float]:
-    """Return unpolarized reflected and transmitted power fractions.
+def polarized_fresnel_coefficients(n1: float, n2: float, cos_i: float) -> dict[str, tuple[float, float]]:
+    """Return s and p reflected and transmitted power fractions.
 
-    Absorption is not included.  The caller is responsible for detecting total
-    internal reflection before calling this function.
+    The interface itself is non-absorbing.  The caller detects total internal
+    reflection before calling this function.
     """
 
     cos_i = min(1.0, abs(cos_i))
@@ -97,5 +134,15 @@ def fresnel_coefficients(n1: float, n2: float, cos_i: float) -> tuple[float, flo
     cos_t = math.sqrt(cos_t2)
     r_s = ((n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t)) ** 2
     r_p = ((n1 * cos_t - n2 * cos_i) / (n1 * cos_t + n2 * cos_i)) ** 2
-    reflected = 0.5 * (r_s + r_p)
+    return {
+        "s": (r_s, 1.0 - r_s),
+        "p": (r_p, 1.0 - r_p),
+    }
+
+
+def fresnel_coefficients(n1: float, n2: float, cos_i: float) -> tuple[float, float]:
+    """Return legacy unpolarized reflected and transmitted power fractions."""
+
+    polarized = polarized_fresnel_coefficients(n1, n2, cos_i)
+    reflected = 0.5 * (polarized["s"][0] + polarized["p"][0])
     return reflected, 1.0 - reflected
