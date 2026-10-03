@@ -4,13 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Optional
+from typing import Mapping, Optional
 
 Vector = tuple[float, float, float]
 
 
 def dot(a: Vector, b: Vector) -> float:
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def cross(a: Vector, b: Vector) -> Vector:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
 
 
 def norm(a: Vector) -> float:
@@ -64,6 +72,9 @@ class Surface:
     back_material: str = "air"
     reflectivity: float = 1.0
     transmissivity: Optional[float] = None
+    polarization_reflectivity: Optional[Mapping[str, float]] = None
+    polarization_transmissivity: Optional[Mapping[str, float]] = None
+    analyzer_angle_deg: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"refract", "mirror", "detector", "beamsplitter", "aperture_stop"}:
@@ -80,7 +91,48 @@ class Surface:
             transmission = 1.0 - self.reflectivity if self.transmissivity is None else self.transmissivity
             if self.reflectivity + transmission > 1.0 + 1e-12:
                 raise ValueError("beamsplitter reflectivity + transmissivity must not exceed 1")
+        for table_name, table in (
+            ("polarization_reflectivity", self.polarization_reflectivity),
+            ("polarization_transmissivity", self.polarization_transmissivity),
+        ):
+            if table is None:
+                continue
+            if self.kind != "beamsplitter":
+                raise ValueError(f"{table_name} is only meaningful on a beamsplitter")
+            for axis, value in table.items():
+                if axis not in ("s", "p"):
+                    raise ValueError(f"{table_name} keys must be 's' or 'p', got {axis!r}")
+                if not 0.0 <= value <= 1.0:
+                    raise ValueError(f"{table_name} values must be between 0 and 1")
+        if self.polarization_reflectivity or self.polarization_transmissivity:
+            axes = set(self.polarization_reflectivity or {}) & set(self.polarization_transmissivity or {})
+            for axis in axes:
+                total = self.polarization_reflectivity[axis] + self.polarization_transmissivity[axis]
+                if total > 1.0 + 1e-12:
+                    raise ValueError(f"polarized reflectivity + transmissivity for {axis!r} must not exceed 1")
+        if self.analyzer_angle_deg is not None and self.kind != "detector":
+            raise ValueError("an analyzer angle is only meaningful on a detector")
         object.__setattr__(self, "axis", normalize(self.axis))
+
+    def polarized_split(self, axis: str) -> Optional[tuple[float, float]]:
+        """(reflectivity, transmissivity) for one polarization axis.
+
+        Returns None when the surface declares a polarization table but has
+        no verified entry for that axis; the caller must treat that as an
+        unknown response rather than falling back to the scalar values.
+        """
+
+        if self.polarization_reflectivity is None and self.polarization_transmissivity is None:
+            return self.reflectivity, self.transmission_fraction()
+        reflectivity = (self.polarization_reflectivity or {}).get(axis)
+        transmissivity = (self.polarization_transmissivity or {}).get(axis)
+        if reflectivity is None and transmissivity is None:
+            return None
+        if reflectivity is None:
+            reflectivity = 1.0 - transmissivity
+        if transmissivity is None:
+            transmissivity = 1.0 - reflectivity
+        return reflectivity, transmissivity
 
     def transmission_fraction(self) -> float:
         """Forward-transmitted power fraction; loss is ``1 - R - T``."""

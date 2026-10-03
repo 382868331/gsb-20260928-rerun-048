@@ -8,13 +8,33 @@ detector hits and energy accounts can be grouped by source ray.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import re
 from typing import Any
 
 from .materials import MaterialLibrary, UnknownMaterialResponse, fresnel_coefficients
-from .surfaces import Surface, add, dot, normalize, scale
+from .materials import fresnel_amplitudes
+from .surfaces import Surface, add, cross, dot, normalize, scale
+
+
+def _reference_basis(direction: tuple[float, float, float]):
+    """Stable transverse basis (u, v) for a propagation direction."""
+
+    reference = (0.0, 0.0, 1.0)
+    if abs(dot(direction, reference)) > 0.9:
+        reference = (0.0, 1.0, 0.0)
+    u = normalize(cross(direction, reference))
+    v = normalize(cross(direction, u))
+    return u, v
+
+
+def _linear_state(direction: tuple[float, float, float], angle_deg: float) -> tuple[float, float, float]:
+    """Unit linear-polarization vector at an angle in the transverse plane."""
+
+    u, v = _reference_basis(direction)
+    theta = math.radians(angle_deg)
+    return normalize(add(scale(u, math.cos(theta)), scale(v, math.sin(theta))))
 
 
 @dataclass(frozen=True)
@@ -25,6 +45,9 @@ class Ray:
     weight: float = 1.0
     label: str | None = None
     spectral_weights: tuple[tuple[float, float], ...] | None = None
+    polarization: tuple[float, float, float] | None = None
+    polarization_angle_deg: float | None = None
+    polarization_weights: tuple[tuple[float, float], ...] | None = None
 
     def normalized(self) -> "Ray":
         return Ray(
@@ -34,6 +57,9 @@ class Ray:
             self.weight,
             self.label,
             self.spectral_weights,
+            self.polarization,
+            self.polarization_angle_deg,
+            self.polarization_weights,
         )
 
     def spectral_components(self) -> tuple[tuple[float, float], ...]:
@@ -58,6 +84,55 @@ class Ray:
         if not components:
             raise ValueError("a spectral ray requires at least one positive component")
         return tuple(components)
+
+    def polarization_components(self):
+        """Return (angle_deg, field vector, absolute power) per component.
+
+        Incoherent components split the input power by fraction, so the
+        parts always sum to the input weight and never to multiple full
+        copies of it.  A ray without polarization_weights is a single
+        component: either its explicit field vector or the legacy
+        unpolarized interpretation.
+        """
+
+        direction = normalize(self.direction)
+        if not self.polarization_weights:
+            return ((self.polarization_angle_deg, self.polarization, self.weight),)
+        total_fraction = sum(fraction for _, fraction in self.polarization_weights)
+        if total_fraction <= 0:
+            raise ValueError("polarization component weights must have a positive sum")
+        angles = [angle for angle, _ in self.polarization_weights]
+        if len(set(angles)) != len(angles):
+            raise ValueError("polarization component angles must be unique")
+        components = []
+        for angle, fraction in self.polarization_weights:
+            if fraction < 0:
+                raise ValueError("polarization component weights must be non-negative")
+            if fraction > 0:
+                components.append((
+                    float(angle),
+                    _linear_state(direction, float(angle)),
+                    self.weight * fraction / total_fraction,
+                ))
+        if not components:
+            raise ValueError("a polarized ray requires at least one positive component")
+        return tuple(components)
+
+    @classmethod
+    def polarized(cls, origin, direction, angles, *,
+                  fractions=None, weight=1.0,
+                  label=None, wavelength_nm=None,
+                  spectral_weights=None) -> "Ray":
+        """Input split into mutually incoherent linear-polarization parts."""
+
+        if not angles:
+            raise ValueError("a polarized ray requires at least one angle")
+        if fractions is None:
+            fractions = [1.0 / len(angles)] * len(angles)
+        if len(fractions) != len(angles):
+            raise ValueError("angles and fractions must have the same length")
+        return cls(origin, direction, wavelength_nm, weight, label, spectral_weights,
+                   None, None, tuple(zip(angles, fractions)))
 
     @classmethod
     def spectral(cls, origin, direction, wavelengths: list[float], *,
@@ -94,6 +169,7 @@ class RayResult:
     detector: str | None = None
     depth: int = 0
     wavelength_nm: float | None = None
+    polarization: float | None = None
 
 
 class RayTracer:
@@ -127,6 +203,7 @@ class RayTracer:
             detector=primary.detector,
             depth=primary.depth,
             wavelength_nm=primary.wavelength_nm,
+            polarization=primary.polarization,
         )
 
     def trace_branches(self, rays: list[Ray]) -> list[RayResult]:
@@ -140,25 +217,31 @@ class RayTracer:
                 if normalized.label is not None
                 else f"ray-{source_index}"
             )
-            if normalized.spectral_weights:
-                for wavelength, component_weight in normalized.spectral_components():
+            spectral_components = (
+                normalized.spectral_components()
+                if normalized.spectral_weights
+                else ((normalized.wavelength_nm, normalized.weight),)
+            )
+            for wavelength, spectral_weight in spectral_components:
+                scale_factor = spectral_weight / normalized.weight if normalized.weight else 0.0
+                polarized_components = normalized.polarization_components()
+                for angle, field_vector, polarization_weight in polarized_components:
                     seed = Ray(
                         normalized.origin,
                         normalized.direction,
                         wavelength,
-                        component_weight,
+                        polarization_weight * scale_factor,
                         source_label,
+                        None,
+                        field_vector,
+                        angle,
                     )
-                    leaves.extend(self._trace_one(seed, f"root[wavelength={wavelength:g}]"))
-            else:
-                seed = Ray(
-                    normalized.origin,
-                    normalized.direction,
-                    normalized.wavelength_nm,
-                    normalized.weight,
-                    source_label,
-                )
-                leaves.extend(self._trace_one(seed))
+                    branch_root = "root"
+                    if normalized.spectral_weights:
+                        branch_root += f"[wavelength={wavelength:g}]"
+                    if normalized.polarization_weights:
+                        branch_root += f"[pol={angle:g}]"
+                    leaves.extend(self._trace_one(seed, branch_root))
         return leaves
 
     def _trace_one(self, seed: Ray, branch_root: str = "root") -> list[RayResult]:
@@ -223,6 +306,43 @@ class RayTracer:
                 "wavelength_nm": current.wavelength_nm,
             }
 
+            # Bulk (volume) loss along the propagated segment, attributed to
+            # the medium on the incident side of the hit surface.  Missing
+            # verified attenuation data ends the branch as unknown instead
+            # of silently assuming a lossless medium.
+            relative = add(current.origin, scale(surface.vertex, -1.0))
+            medium_name = (
+                surface.back_material
+                if dot(relative, surface.axis) > 0
+                else surface.front_material
+            )
+            try:
+                attenuation = self.materials.bulk_attenuation(medium_name, current.wavelength_nm)
+            except UnknownMaterialResponse as exc:
+                event.update({
+                    "action": "unknown_material_response",
+                    "medium": medium_name,
+                    "reason": str(exc),
+                    "final_direction": incident,
+                    "absorbed_power": 0.0,
+                    "bulk_loss_power": 0.0,
+                })
+                event["event_uid"] = event_counter
+                event_counter += 1
+                leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                continue
+            propagation_loss = (
+                weight * (1.0 - math.exp(-attenuation * t)) if attenuation > 0.0 else 0.0
+            )
+            if propagation_loss > 0.0:
+                weight -= propagation_loss
+                current = replace(current, weight=weight)
+                state = {**state, "ray": current}
+                event["incident_weight"] = weight
+            event["medium"] = medium_name
+            event["propagation_distance"] = t
+            event["bulk_loss_power"] = propagation_loss
+
             if edge_hit or cosine < settings.grazing_cosine:
                 event.update({
                     "action": "grazing",
@@ -241,6 +361,16 @@ class RayTracer:
                     "final_direction": incident,
                     "absorbed_power": 0.0,
                 })
+                if surface.analyzer_angle_deg is not None:
+                    fraction = self._analyzer_fraction(surface, current)
+                    transmitted = weight * fraction
+                    event.update({
+                        "analyzer_angle_deg": surface.analyzer_angle_deg,
+                        "analyzer_transmitted_power": transmitted,
+                        "analyzer_rejected_power": weight - transmitted,
+                    })
+                    current = replace(current, weight=transmitted)
+                    state = {**state, "ray": current}
                 event["event_uid"] = event_counter
                 event_counter += 1
                 leaves.append(self._finish(seed, state, event, "reached_image", point, surface.identifier))
@@ -257,12 +387,11 @@ class RayTracer:
                 })
                 event["event_uid"] = event_counter
                 event_counter += 1
-                outgoing = Ray(
-                    self._offset(point, incident),
-                    incident,
-                    current.wavelength_nm,
-                    weight,
-                    seed.label,
+                outgoing = replace(
+                    current,
+                    origin=self._offset(point, incident),
+                    direction=incident,
+                    weight=weight,
                 )
                 pending.append(self._advance(state, event, outgoing, surface.identifier, state["saw_tir"], event_counter - 1))
                 continue
@@ -270,11 +399,32 @@ class RayTracer:
             if surface.kind == "beamsplitter":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 transmitted = tuple(incident)
-                # ``reflectivity`` always means the reflected power
-                # fraction, matching mirrors; transmission defaults to the
-                # lossless complement and may be set explicitly.
-                reflected_fraction = surface.reflectivity
-                transmitted_fraction = surface.transmission_fraction()
+                # reflectivity always means the reflected power fraction,
+                # matching mirrors; transmission defaults to the lossless
+                # complement and may be set explicitly.  Polarization
+                # tables, when declared, override the scalars per axis.
+                decomposition = self._polarized_split(surface, incident, normal, current)
+                if decomposition is None:
+                    event.update({
+                        "action": "unknown_polarization_response",
+                        "reason": (
+                            f"beamsplitter {surface.identifier!r} declares a polarization"
+                            " table without a verified entry for every s/p axis"
+                        ),
+                        "final_direction": incident,
+                        "absorbed_power": 0.0,
+                    })
+                    event["event_uid"] = event_counter
+                    event_counter += 1
+                    leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                    continue
+                (
+                    reflected_fraction,
+                    transmitted_fraction,
+                    reflected_field,
+                    transmitted_field,
+                    s_fraction,
+                ) = decomposition
                 reflected_weight = weight * reflected_fraction
                 transmitted_weight = weight * transmitted_fraction
                 absorbed_power = max(0.0, weight - reflected_weight - transmitted_weight)
@@ -283,6 +433,7 @@ class RayTracer:
                     "cosine_incidence": cosine,
                     "reflectivity": reflected_fraction,
                     "transmissivity": transmitted_fraction,
+                    "polarization_s_fraction": s_fraction,
                     "reflected_power": reflected_weight,
                     "transmitted_power": transmitted_weight,
                     "absorbed_power": absorbed_power,
@@ -305,8 +456,13 @@ class RayTracer:
                     children.append({
                         **common,
                         "events": list(base_events),
-                        "ray": Ray(self._offset(point, reflected), reflected,
-                                  current.wavelength_nm, reflected_weight, seed.label),
+                        "ray": replace(
+                            current,
+                            origin=self._offset(point, reflected),
+                            direction=reflected,
+                            weight=reflected_weight,
+                            polarization=reflected_field,
+                        ),
                         "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
                         "parent_branch_id": state["branch_id"],
                     })
@@ -314,8 +470,13 @@ class RayTracer:
                     children.append({
                         **common,
                         "events": list(base_events),
-                        "ray": Ray(self._offset(point, transmitted), transmitted,
-                                  current.wavelength_nm, transmitted_weight, seed.label),
+                        "ray": replace(
+                            current,
+                            origin=self._offset(point, transmitted),
+                            direction=transmitted,
+                            weight=transmitted_weight,
+                            polarization=transmitted_field,
+                        ),
                         "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
                         "parent_branch_id": state["branch_id"],
                     })
@@ -343,12 +504,12 @@ class RayTracer:
                 event["event_uid"] = event_counter
                 event_counter += 1
                 if new_weight > 0.0:
-                    outgoing = Ray(
-                        self._offset(point, reflected),
-                        reflected,
-                        current.wavelength_nm,
-                        new_weight,
-                        seed.label,
+                    outgoing = replace(
+                        current,
+                        origin=self._offset(point, reflected),
+                        direction=reflected,
+                        weight=new_weight,
+                        polarization=self._reflect_field(current, normal),
                     )
                     pending.append(self._advance(state, event, outgoing, surface.identifier, state["saw_tir"], event_counter - 1))
                 else:
@@ -403,12 +564,12 @@ class RayTracer:
                 })
                 event["event_uid"] = event_counter
                 event_counter += 1
-                outgoing = Ray(
-                    self._offset(point, reflected),
-                    reflected,
-                    current.wavelength_nm,
-                    weight,
-                    seed.label,
+                outgoing = replace(
+                    current,
+                    origin=self._offset(point, reflected),
+                    direction=reflected,
+                    weight=weight,
+                    polarization=self._reflect_field(current, normal),
                 )
                 pending.append(self._advance(state, event, outgoing, surface.identifier, True, event_counter - 1))
                 continue
@@ -418,7 +579,19 @@ class RayTracer:
                 for i in range(3)
             ))
             reflected = self._reflect(current.direction, scale(normal, -1.0))
-            reflected_fraction, transmitted_fraction = fresnel_coefficients(n1, n2, cos_i)
+            reflected_field = None
+            transmitted_field = None
+            s_fraction = None
+            if current.polarization is not None:
+                (
+                    reflected_fraction,
+                    transmitted_fraction,
+                    reflected_field,
+                    transmitted_field,
+                    s_fraction,
+                ) = self._polarized_fresnel(n1, n2, cos_i, incident, normal, refracted, reflected, current)
+            else:
+                reflected_fraction, transmitted_fraction = fresnel_coefficients(n1, n2, cos_i)
             reflected_weight = weight * reflected_fraction
             transmitted_weight = weight * transmitted_fraction
             absorbed_power = max(0.0, weight - reflected_weight - transmitted_weight)
@@ -427,6 +600,7 @@ class RayTracer:
                 "n_incident": n1,
                 "n_transmitted": n2,
                 "cosine_incidence": cos_i,
+                "polarization_s_fraction": s_fraction,
                 "reflected_power": reflected_weight,
                 "transmitted_power": transmitted_weight,
                 "absorbed_power": absorbed_power,
@@ -447,12 +621,12 @@ class RayTracer:
                 "saw_tir": state["saw_tir"],
             }
             if reflected_weight > 0.0:
-                reflected_ray = Ray(
-                    self._offset(point, reflected),
-                    reflected,
-                    current.wavelength_nm,
-                    reflected_weight,
-                    seed.label,
+                reflected_ray = replace(
+                    current,
+                    origin=self._offset(point, reflected),
+                    direction=reflected,
+                    weight=reflected_weight,
+                    polarization=reflected_field,
                 )
                 pending.append({
                     **common,
@@ -461,12 +635,12 @@ class RayTracer:
                     "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
                     "parent_branch_id": state["branch_id"],
                 })
-            transmitted_ray = Ray(
-                self._offset(point, refracted),
-                refracted,
-                current.wavelength_nm,
-                transmitted_weight,
-                seed.label,
+            transmitted_ray = replace(
+                current,
+                origin=self._offset(point, refracted),
+                direction=refracted,
+                weight=transmitted_weight,
+                polarization=transmitted_field,
             )
             pending.append({
                 **common,
@@ -511,6 +685,7 @@ class RayTracer:
             detector=detector,
             depth=state["depth"],
             wavelength_nm=seed.wavelength_nm,
+            polarization=seed.polarization_angle_deg,
         )
 
     def _finish(self, seed: Ray, state: dict[str, Any], event: dict[str, Any], status: str, point, detector: str | None) -> RayResult:
@@ -546,6 +721,104 @@ class RayTracer:
     def _reflect(direction, normal) -> tuple[float, float, float]:
         factor = 2.0 * dot(direction, normal)
         return normalize(tuple(direction[i] - factor * normal[i] for i in range(3)))
+
+    @staticmethod
+    def _sp_basis(direction, normal):
+        """Local s/p unit vectors for an incident direction and normal."""
+
+        s_axis = cross(direction, normal)
+        length = math.sqrt(dot(s_axis, s_axis))
+        if length < 1e-12:
+            s_axis, _ = _reference_basis(direction)
+        else:
+            s_axis = scale(s_axis, 1.0 / length)
+        p_axis = normalize(cross(s_axis, direction))
+        return s_axis, p_axis
+
+    def _polarized_split(self, surface, incident, normal, ray: Ray):
+        """Beamsplitter fractions and child fields for the ray polarization.
+
+        Returns None when the surface declares polarization tables but has
+        no verified response for an axis the ray actually carries; the
+        caller must end the branch as unknown instead of substituting the
+        scalar (unpolarized) numbers.
+        """
+
+        split_s = surface.polarized_split("s")
+        split_p = surface.polarized_split("p")
+        if split_s is None or split_p is None:
+            return None
+        (r_s, t_s), (r_p, t_p) = split_s, split_p
+        if ray.polarization is None:
+            s_fraction = 0.5
+            reflected_fraction = 0.5 * (r_s + r_p)
+            transmitted_fraction = 0.5 * (t_s + t_p)
+            return reflected_fraction, transmitted_fraction, None, None, s_fraction
+        s_axis, p_axis = self._sp_basis(incident, normal)
+        e_s = dot(ray.polarization, s_axis)
+        e_p = dot(ray.polarization, p_axis)
+        s_fraction = e_s * e_s
+        p_fraction = e_p * e_p
+        reflected_fraction = s_fraction * r_s + p_fraction * r_p
+        transmitted_fraction = s_fraction * t_s + p_fraction * t_p
+        reflected = self._reflect(incident, scale(normal, -1.0))
+        reflected_p_axis = normalize(cross(s_axis, reflected))
+        reflected_field = self._combine_field(
+            e_s * math.sqrt(r_s), s_axis,
+            e_p * math.sqrt(r_p), reflected_p_axis,
+            ray.polarization,
+        )
+        transmitted_field = self._combine_field(
+            e_s * math.sqrt(t_s), s_axis,
+            e_p * math.sqrt(t_p), p_axis,
+            ray.polarization,
+        )
+        return reflected_fraction, transmitted_fraction, reflected_field, transmitted_field, s_fraction
+
+    def _polarized_fresnel(self, n1, n2, cos_i, incident, normal, refracted, reflected, ray: Ray):
+        """Fresnel split for a linearly polarized ray (lossless interface)."""
+
+        r_s, r_p, t_s, t_p = fresnel_amplitudes(n1, n2, cos_i)
+        s_axis, p_axis = self._sp_basis(incident, normal)
+        e_s = dot(ray.polarization, s_axis)
+        e_p = dot(ray.polarization, p_axis)
+        s_fraction = e_s * e_s
+        p_fraction = e_p * e_p
+        reflected_fraction = s_fraction * r_s * r_s + p_fraction * r_p * r_p
+        transmitted_fraction = 1.0 - reflected_fraction
+        reflected_p_axis = normalize(cross(s_axis, reflected))
+        transmitted_p_axis = normalize(cross(s_axis, refracted))
+        reflected_field = self._combine_field(
+            e_s * r_s, s_axis, e_p * r_p, reflected_p_axis, ray.polarization,
+        )
+        transmitted_field = self._combine_field(
+            e_s * t_s, s_axis, e_p * t_p, transmitted_p_axis, ray.polarization,
+        )
+        return reflected_fraction, transmitted_fraction, reflected_field, transmitted_field, s_fraction
+
+    @staticmethod
+    def _combine_field(s_amplitude, s_axis, p_amplitude, p_axis, fallback):
+        vector = add(scale(s_axis, s_amplitude), scale(p_axis, p_amplitude))
+        if math.sqrt(dot(vector, vector)) < 1e-12:
+            return fallback
+        return normalize(vector)
+
+    def _reflect_field(self, ray: Ray, normal):
+        if ray.polarization is None:
+            return None
+        return self._reflect(ray.polarization, normal)
+
+    @staticmethod
+    def _analyzer_fraction(surface: Surface, ray: Ray) -> float:
+        """Power fraction passing the detector analyzer."""
+
+        if ray.polarization is None:
+            return 0.5
+        u_axis, v_axis = _reference_basis(surface.axis)
+        theta = math.radians(surface.analyzer_angle_deg)
+        analyzer = add(scale(u_axis, math.cos(theta)), scale(v_axis, math.sin(theta)))
+        projection = dot(ray.polarization, analyzer)
+        return projection * projection
 
     def _offset(self, point, direction) -> tuple[float, float, float]:
         return add(point, scale(direction, self.settings.ray_offset))

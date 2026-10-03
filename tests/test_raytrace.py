@@ -614,5 +614,329 @@ class RayTraceTests(unittest.TestCase):
         )
 
 
+class PolarizationTests(unittest.TestCase):
+    def setUp(self):
+        self.materials = MaterialLibrary()
+        self.materials.add(Material("glass", 1.5))
+
+    @staticmethod
+    def _polarizing_splitter_project(**splitter_kwargs):
+        a = math.sqrt(0.5)
+        materials = MaterialLibrary()
+        materials.add(Material("glass", 1.5))
+        surfaces = [
+            PlaneSurface(
+                "splitter",
+                (0.0, 0.0, 0.0),
+                (a, a, 0.0),
+                kind="beamsplitter",
+                aperture=CircularAperture(5.0),
+                **splitter_kwargs,
+            ),
+            PlaneSurface(
+                "det_transmitted",
+                (2.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                kind="detector",
+                aperture=CircularAperture(3.0),
+            ),
+            PlaneSurface(
+                "det_reflected",
+                (0.0, -2.0, 0.0),
+                (0.0, -1.0, 0.0),
+                kind="detector",
+                aperture=CircularAperture(3.0),
+            ),
+        ]
+        return Project("pol-splitter", surfaces, materials)
+
+    def test_incoherent_components_share_not_double_the_input_power(self):
+        project = self._polarizing_splitter_project(
+            polarization_reflectivity={"s": 0.8, "p": 0.2},
+        )
+        ray = Ray.polarized((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [0.0, 90.0], label="src")
+        batch = project.trace_rays([ray])
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+
+        self.assertAlmostEqual(ledger["input"], 1.0)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        detected = batch.detector_summary()
+        total_detected = sum(summary["power"] for summary in detected.values())
+        self.assertLessEqual(total_detected, 1.0 + 1e-12)
+        self.assertAlmostEqual(
+            total_detected + ledger["unreached"] + ledger["absorbed"], 1.0, places=12,
+        )
+        roots = sorted({leaf.branch_id.split(".")[0] for leaf in batch.results})
+        self.assertEqual(roots, ["root[pol=0]", "root[pol=90]"])
+
+    def test_rotating_input_polarization_moves_power_between_paths(self):
+        project = self._polarizing_splitter_project(
+            polarization_reflectivity={"s": 0.9, "p": 0.1},
+        )
+        # angle 0 lies in the plane of incidence (p), 90 is perpendicular (s)
+        batch_p = project.trace_rays([
+            Ray.polarized((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [0.0], label="src")
+        ])
+        batch_s = project.trace_rays([
+            Ray.polarized((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [90.0], label="src")
+        ])
+
+        summary_p = batch_p.detector_summary()
+        summary_s = batch_s.detector_summary()
+        self.assertAlmostEqual(summary_p["det_transmitted"]["power"], 0.9, places=12)
+        self.assertAlmostEqual(summary_p["det_reflected"]["power"], 0.1, places=12)
+        self.assertAlmostEqual(summary_s["det_transmitted"]["power"], 0.1, places=12)
+        self.assertAlmostEqual(summary_s["det_reflected"]["power"], 0.9, places=12)
+
+        comparison = batch_p.compare_polarization_response(
+            batch_s, input_power={"src": 1.0}
+        )
+        self.assertAlmostEqual(
+            comparison["detectors"]["det_reflected"]["delta"], 0.8, places=12
+        )
+        self.assertAlmostEqual(
+            comparison["detectors"]["det_transmitted"]["delta"], -0.8, places=12
+        )
+        self.assertAlmostEqual(
+            comparison["energy_ledger"]["src"]["delta"]["unaccounted"], 0.0, places=12
+        )
+
+    def test_analyzer_rejected_energy_is_reported_separately(self):
+        materials = MaterialLibrary()
+        surfaces = [
+            PlaneSurface(
+                "image",
+                (1.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                kind="detector",
+                aperture=CircularAperture(2.0),
+                analyzer_angle_deg=0.0,
+            ),
+        ]
+        project = Project("analyzer", surfaces, materials)
+        aligned = project.trace_rays([
+            Ray.polarized((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), [0.0], label="src")
+        ])
+        crossed = project.trace_rays([
+            Ray.polarized((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), [90.0], label="src")
+        ])
+        diagonal = project.trace_rays([
+            Ray.polarized((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), [45.0], label="src")
+        ])
+
+        self.assertAlmostEqual(
+            aligned.energy_ledger(input_power={"src": 1.0})["src"]["detected"], 1.0
+        )
+        crossed_ledger = crossed.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(crossed_ledger["detected"], 0.0)
+        self.assertAlmostEqual(crossed_ledger["analyzer_rejected"], 1.0)
+        self.assertAlmostEqual(crossed_ledger["unaccounted"], 0.0, places=12)
+        diagonal_ledger = diagonal.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(diagonal_ledger["detected"], 0.5)
+        self.assertAlmostEqual(diagonal_ledger["analyzer_rejected"], 0.5)
+        self.assertAlmostEqual(diagonal_ledger["unaccounted"], 0.0, places=12)
+
+    def test_tir_and_partial_transmission_coexist_across_wavelengths(self):
+        materials = MaterialLibrary()
+        materials.add(Material("glass", 1.5, spectral_indices={450.0: 1.8, 650.0: 1.4}))
+        cos40 = math.cos(math.radians(40.0))
+        sin40 = math.sin(math.radians(40.0))
+        cos80 = math.cos(math.radians(80.0))
+        sin80 = math.sin(math.radians(80.0))
+        surfaces = [
+            PlaneSurface(
+                "exit",
+                (1.0, 0.0, 0.0),
+                (cos40, sin40, 0.0),
+                kind="refract",
+                aperture=CircularAperture(5.0),
+                front_material="glass",
+            ),
+            PlaneSurface(
+                "det_tir",
+                (1.0 - cos80, -sin80, 0.0),
+                (cos80, sin80, 0.0),
+                kind="detector",
+                aperture=CircularAperture(3.0),
+            ),
+            PlaneSurface(
+                "det_transmitted",
+                (3.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                kind="detector",
+                aperture=CircularAperture(5.0),
+            ),
+        ]
+        project = Project("spectral-tir", surfaces, materials)
+        ray = Ray.spectral(
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="src"
+        )
+        batch = project.trace_rays([ray])
+
+        actions_450 = [
+            event["action"]
+            for leaf in batch.results
+            if leaf.wavelength_nm == 450.0
+            for event in leaf.events
+        ]
+        actions_650 = [
+            event["action"]
+            for leaf in batch.results
+            if leaf.wavelength_nm == 650.0
+            for event in leaf.events
+        ]
+        self.assertIn("total_internal_reflection", actions_450)
+        self.assertNotIn("refract", actions_450)
+        self.assertIn("refract", actions_650)
+        self.assertNotIn("total_internal_reflection", actions_650)
+
+        summary = batch.detector_summary()
+        # det_tir also collects the 650 nm Fresnel reflection, which follows
+        # the same geometric path as the 450 nm total internal reflection
+        cos_i = math.cos(math.radians(40.0))
+        cos_t = math.sqrt(1.0 - 1.4 ** 2 * (1.0 - cos_i ** 2))
+        r_s = ((1.4 * cos_i - cos_t) / (1.4 * cos_i + cos_t)) ** 2
+        r_p = ((1.4 * cos_t - cos_i) / (1.4 * cos_t + cos_i)) ** 2
+        expected_tir = 0.5 + 0.5 * 0.5 * (r_s + r_p)
+        self.assertAlmostEqual(summary["det_tir"]["power"], expected_tir, places=12)
+        self.assertGreater(summary["det_transmitted"]["power"], 0.4)
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        for wavelength_account in ledger["by_wavelength"].values():
+            self.assertAlmostEqual(wavelength_account["unaccounted"], 0.0, places=12)
+
+    def test_missing_polarization_response_stays_unknown(self):
+        project = self._polarizing_splitter_project(
+            polarization_reflectivity={"s": 0.5},
+        )
+        ray = Ray.polarized((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [0.0], label="src")
+        batch = project.trace_rays([ray])
+
+        self.assertEqual(batch.status_summary(), {"unknown_response": 1})
+        self.assertEqual(batch.detector_hits(), {})
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unknown_response"], 1.0)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        self.assertEqual(
+            batch.results[0].events[-1]["action"], "unknown_polarization_response"
+        )
+
+    def test_recombined_branches_feed_one_detector_without_double_counting(self):
+        a = math.sqrt(0.5)
+        surfaces = [
+            PlaneSurface("splitter1", (0.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(0.5),
+                         reflectivity=0.5),
+            PlaneSurface("mirror_top", (3.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(0.5)),
+            PlaneSurface("mirror_side", (0.0, -2.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(0.5)),
+            PlaneSurface("splitter2", (3.0, -2.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(0.5),
+                         reflectivity=0.5),
+            PlaneSurface("detector", (5.0, -2.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        project = Project("mach-zehnder", surfaces, self.materials)
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+
+        summary = batch.detector_summary()["detector"]
+        self.assertAlmostEqual(summary["power"], 0.5, places=12)
+        self.assertEqual(summary["count"], 2)
+        paths = sorted(tuple(hit["path"]) for hit in summary["branches"])
+        self.assertEqual(len(paths), 2)
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["detected"], 0.5, places=12)
+        self.assertAlmostEqual(ledger["unreached"], 0.5, places=12)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+
+    def test_bulk_loss_is_tracked_separately_from_surface_loss(self):
+        materials = MaterialLibrary()
+        materials.add(Material("glass", 1.5, bulk_attenuation=0.5))
+        surfaces = [
+            PlaneSurface("front", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="refract", aperture=CircularAperture(2.0),
+                         back_material="glass"),
+            PlaneSurface("back", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="refract", aperture=CircularAperture(2.0),
+                         front_material="glass"),
+            PlaneSurface("image", (2.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        project = Project("lossy-slab", surfaces, materials)
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+
+        # each glass pass loses 1 - exp(-0.5); the 4% Fresnel reflection at
+        # each exit bounces back for another pass, forming a geometric series
+        q = math.exp(-0.5)
+        expected_bulk = 0.96 * (1.0 - q) / (1.0 - 0.04 * q)
+        self.assertAlmostEqual(ledger["bulk_loss"], expected_bulk, places=7)
+        self.assertGreater(ledger["bulk_loss"], 0.0)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        flow = batch.branch_energy_flow()
+        refract_steps = [
+            step for entry in flow for step in entry["steps"]
+            if step["action"] == "refract"
+        ]
+        self.assertTrue(any(step["bulk_loss_power"] > 0.0 for step in refract_steps))
+
+    def test_spectral_and_polarized_components_combine_without_extra_energy(self):
+        project = self._polarizing_splitter_project(reflectivity=0.3)
+        ray = Ray.polarized(
+            (-1.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            [0.0, 90.0],
+            label="src",
+            spectral_weights=((450.0, 1.0), (650.0, 1.0)),
+        )
+        batch = project.trace_rays([ray])
+
+        roots = sorted({leaf.branch_id.split(".")[0] for leaf in batch.results})
+        self.assertEqual(
+            roots,
+            [
+                "root[wavelength=450][pol=0]",
+                "root[wavelength=450][pol=90]",
+                "root[wavelength=650][pol=0]",
+                "root[wavelength=650][pol=90]",
+            ],
+        )
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        summary = batch.detector_summary()
+        # each polarization key aggregates both wavelengths: 2 x 0.25 x R or T
+        transmitted = summary["det_transmitted"]["power_by_polarization"]
+        reflected = summary["det_reflected"]["power_by_polarization"]
+        for key in ("0 deg", "90 deg"):
+            self.assertAlmostEqual(transmitted[key], 0.35, places=12)
+            self.assertAlmostEqual(reflected[key], 0.15, places=12)
+
+    def test_unpolarized_batch_reopens_with_original_interpretation(self):
+        project = self._polarizing_splitter_project(reflectivity=0.3)
+        old_batch = project.trace_rays([
+            Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="old")
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.json"
+            old_batch.save(path)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            for key in ("polarization", "polarization_angle_deg", "polarization_weights"):
+                for ray_dict in raw["rays"]:
+                    ray_dict.pop(key, None)
+                for result in raw["results"]:
+                    result.pop("polarization", None)
+                    result["ray"].pop(key, None)
+            reloaded = type(old_batch).from_dict(raw)
+
+        self.assertEqual(reloaded.detector_summary(), old_batch.detector_summary())
+        self.assertEqual(reloaded.energy_ledger(), old_batch.energy_ledger())
+        summary = reloaded.detector_summary()
+        self.assertAlmostEqual(
+            summary["det_transmitted"]["power_by_polarization"]["unpolarized"],
+            0.7,
+            places=12,
+        )
+
 if __name__ == "__main__":
     unittest.main()
