@@ -5,9 +5,14 @@ import unittest
 from pathlib import Path
 
 from raytrace import (
+    ChannelResponse,
     CircularAperture,
+    InconsistentMeasurement,
+    Interval,
     Material,
     MaterialLibrary,
+    MeasurementBatch,
+    MeasurementBook,
     PlaneSurface,
     Project,
     Ray,
@@ -937,6 +942,304 @@ class PolarizationTests(unittest.TestCase):
             0.7,
             places=12,
         )
+
+
+
+class MeasuredResponseTests(unittest.TestCase):
+    """Interval-valued measured element responses with provenance."""
+
+    def setUp(self):
+        self.materials = MaterialLibrary()
+
+    @staticmethod
+    def _splitter_surfaces():
+        return [
+            PlaneSurface(
+                "splitter",
+                (0.0, 0.0, 0.0),
+                (1.0, 1.0, 0.0),
+                kind="beamsplitter",
+                aperture=CircularAperture(1.0),
+                reflectivity=0.5,
+            ),
+            PlaneSurface(
+                "det_transmitted",
+                (2.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                kind="detector",
+                aperture=CircularAperture(2.0),
+            ),
+            PlaneSurface(
+                "det_reflected",
+                (0.0, -2.0, 0.0),
+                (0.0, -1.0, 0.0),
+                kind="detector",
+                aperture=CircularAperture(2.0),
+            ),
+        ]
+
+    @staticmethod
+    def _recombine_surfaces():
+        return [
+            PlaneSurface(
+                "splitter",
+                (0.0, 0.0, 0.0),
+                (1.0, 1.0, 0.0),
+                kind="beamsplitter",
+                aperture=CircularAperture(1.0),
+                reflectivity=0.5,
+            ),
+            PlaneSurface(
+                "fold",
+                (0.0, -2.0, 0.0),
+                (-1.0, -1.0, 0.0),
+                kind="mirror",
+                aperture=CircularAperture(2.0),
+                reflectivity=1.0,
+            ),
+            PlaneSurface(
+                "det",
+                (2.0, -1.0, 0.0),
+                (1.0, 0.0, 0.0),
+                kind="detector",
+                aperture=CircularAperture(1.5),
+            ),
+        ]
+
+    @staticmethod
+    def _batch(name, reflectivity, absorptivity=(0.0, 0.0), axes=("s", "p")):
+        entries = {}
+        for axis in axes:
+            entries[f"splitter|unspecified|{axis}"] = ChannelResponse(
+                reflectivity=Interval(*reflectivity),
+                absorptivity=Interval(*absorptivity),
+            )
+        return MeasurementBatch(name, entries, condition=f"campaign {name}")
+
+    def _project(self, surfaces, batches, active=None):
+        return Project(
+            "measured",
+            surfaces,
+            self.materials,
+            measurements=MeasurementBook(batches, active=active),
+        )
+
+    def test_interval_split_reports_definite_range_and_unknown(self):
+        # s/p both measured as intervals: detector power is a possible range.
+        project = self._project(
+            self._splitter_surfaces(), [self._batch("calib-a", (0.4, 0.6))]
+        )
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        summary = batch.detector_summary()
+        self.assertAlmostEqual(summary["det_transmitted"]["power"], 0.5, places=12)
+        self.assertEqual(summary["det_transmitted"]["power_range"], [0.4, 0.6])
+        self.assertEqual(summary["det_reflected"]["power_range"], [0.4, 0.6])
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        # R + T = 1 symbolically, so the detected total is definite even
+        # though each detector alone carries a possible range.
+        self.assertIsNone(ledger["detected_range"])
+        self.assertAlmostEqual(ledger["detected"], 1.0, places=12)
+        # degenerate interval -> definite energy, no range attached
+        definite = self._project(
+            self._splitter_surfaces(), [self._batch("calib-exact", (0.5, 0.5))]
+        )
+        definite_batch = definite.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        for leaf in definite_batch.results:
+            self.assertIsNone(leaf.weight_range)
+        self.assertEqual(
+            definite_batch.detector_summary()["det_transmitted"]["power_range"],
+            [0.5, 0.5],
+        )
+
+    def test_missing_channel_is_unknown_not_lossless(self):
+        # Only the s axis measured: the p channel must not default to lossless.
+        project = self._project(
+            self._splitter_surfaces(),
+            [self._batch("calib-partial", (0.4, 0.6), axes=("s",))],
+        )
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        self.assertEqual(batch.status_summary(), {"unknown_response": 1})
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unknown_response"], 1.0, places=12)
+        self.assertAlmostEqual(ledger["detected"], 0.0, places=12)
+        actions = [event["action"] for event in batch.results[0].events]
+        self.assertEqual(actions, ["unknown_measured_response"])
+
+    def test_energy_constraint_tightens_joint_intervals(self):
+        response = ChannelResponse(
+            reflectivity=Interval(0.4, 0.9),
+            transmissivity=Interval(0.4, 0.9),
+        )
+        reflectivity, transmissivity, absorptivity = response.resolved()
+        self.assertEqual((reflectivity.low, reflectivity.high), (0.4, 0.6))
+        self.assertEqual((transmissivity.low, transmissivity.high), (0.4, 0.6))
+        self.assertAlmostEqual(absorptivity.low, 0.0, places=12)
+        self.assertAlmostEqual(absorptivity.high, 0.2, places=12)
+        # each upper bound is capped by the other channels' lower bounds, so
+        # no combination of bounds can exceed the total input energy
+        self.assertLessEqual(reflectivity.high + transmissivity.low + absorptivity.low, 1.0)
+        self.assertLessEqual(transmissivity.high + reflectivity.low + absorptivity.low, 1.0)
+        with self.assertRaises(InconsistentMeasurement):
+            ChannelResponse(
+                reflectivity=Interval(0.6, 0.7),
+                transmissivity=Interval(0.6, 0.7),
+            )
+        with self.assertRaises(InconsistentMeasurement):
+            ChannelResponse(
+                reflectivity=Interval(0.2, 0.3),
+                transmissivity=Interval(0.2, 0.3),
+                absorptivity=Interval(0.7, 0.8),
+            )
+        with self.assertRaises(InconsistentMeasurement):
+            ChannelResponse(reflectivity=Interval(0.3, 0.5))
+
+    def test_recombined_beams_keep_source_correlation(self):
+        # R in [0.4, 0.6], T derived as the exact complement: after the fold
+        # mirror both children land on the same detector and the shared
+        # uncertainty cancels instead of adding as independent error.
+        project = self._project(
+            self._recombine_surfaces(), [self._batch("calib-a", (0.4, 0.6))]
+        )
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        summary = batch.detector_summary()["det"]
+        self.assertEqual(summary["count"], 2)
+        naive_low = sum(hit["power_range"][0] for hit in summary["branches"])
+        naive_high = sum(hit["power_range"][1] for hit in summary["branches"])
+        self.assertEqual((round(naive_low, 12), round(naive_high, 12)), (0.8, 1.2))
+        self.assertEqual(summary["power_range"], [1.0, 1.0])
+        self.assertAlmostEqual(summary["power"], 1.0, places=12)
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        self.assertIsNone(ledger["detected_range"])  # fully definite after recombine
+
+    def test_mutually_exclusive_batches_compare_and_revoke(self):
+        batches = [
+            self._batch("calib-a", (0.3, 0.4)),
+            self._batch("calib-b", (0.6, 0.7)),
+        ]
+        project = self._project(self._splitter_surfaces(), batches)
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        comparison = project.compare_measurement_batches("calib-a", "calib-b", rays)
+        range_a = comparison["power_ranges"]["calib-a"]["det_reflected"]
+        range_b = comparison["power_ranges"]["calib-b"]["det_reflected"]
+        self.assertEqual([round(v, 12) for v in range_a], [0.3, 0.4])
+        self.assertEqual([round(v, 12) for v in range_b], [0.6, 0.7])
+        self.assertLess(range_a[1], range_b[0])  # disjoint, mutually exclusive
+        delta = comparison["detectors"]["det_reflected"]
+        self.assertAlmostEqual(delta["before"], 0.35, places=12)
+        self.assertAlmostEqual(delta["after"], 0.65, places=12)
+
+        # Revoking both batches leaves the element unmeasured: the recompute
+        # reports unknown_response instead of reusing revoked numbers.
+        project.revoke_measurement("calib-a")
+        project.revoke_measurement("calib-b")
+        recomputed = project.trace_rays(rays)
+        self.assertEqual(recomputed.status_summary(), {"unknown_response": 1})
+        self.assertEqual(
+            recomputed.measurement_basis["revoked"], ["calib-a", "calib-b"]
+        )
+
+    def test_save_and_reopen_preserves_basis_and_ranges(self):
+        batches = [
+            self._batch("calib-a", (0.3, 0.4)),
+            self._batch("calib-b", (0.6, 0.7)),
+        ]
+        project = self._project(self._splitter_surfaces(), batches)
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        batch = project.trace_rays(rays)
+        self.assertEqual(batch.measurement_basis["active"], ["calib-a", "calib-b"])
+        self.assertEqual(set(batch.measurement_basis["digests"]), {"calib-a", "calib-b"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            batch_path = Path(directory) / "batch.json"
+            project_path = Path(directory) / "project.json"
+            batch.save(batch_path)
+            project.save(project_path)
+
+            # The project is revised after archiving: the old batch JSON
+            # still points at the original measurement basis.
+            project.revoke_measurement("calib-a")
+            project.revoke_measurement("calib-b")
+
+            from raytrace import load_batch, load_project
+            reopened_batch = load_batch(batch_path)
+            self.assertEqual(
+                reopened_batch.measurement_basis["active"], ["calib-a", "calib-b"]
+            )
+            self.assertEqual(reopened_batch.detector_summary(), batch.detector_summary())
+            self.assertEqual(reopened_batch.energy_ledger(), batch.energy_ledger())
+            reopened_leaf = reopened_batch.results[0]
+            self.assertIsNotNone(reopened_leaf.weight_range)
+            self.assertIsNotNone(reopened_leaf.weight_terms)
+
+            # The archived project still carries both batches; reloading it
+            # reproduces the original intervals exactly.
+            archived = load_project(project_path)
+            self.assertEqual(
+                set(archived.measurements.batches), {"calib-a", "calib-b"}
+            )
+            retraced = archived.trace_rays(rays)
+            for detector, summary in batch.detector_summary().items():
+                retraced_summary = retraced.detector_summary()[detector]
+                self.assertAlmostEqual(
+                    retraced_summary["power"], summary["power"], places=9
+                )
+                self.assertEqual(
+                    [round(v, 9) for v in retraced_summary["power_range"]],
+                    [round(v, 9) for v in summary["power_range"]],
+                )
+
+            # A project saved after revocation reopens with the channels
+            # unknown rather than silently reactivating the revoked batch.
+            revoked_path = Path(directory) / "revoked.json"
+            project.save(revoked_path)
+            revoked = load_project(revoked_path)
+            self.assertEqual(revoked.measurements.active, [])
+            self.assertEqual(
+                revoked.trace_rays(rays).status_summary(), {"unknown_response": 1}
+            )
+
+    def test_measured_mirror_interval(self):
+        surfaces = [
+            PlaneSurface(
+                "fold",
+                (0.0, 0.0, 0.0),
+                (-1.0, -1.0, 0.0),
+                kind="mirror",
+                aperture=CircularAperture(2.0),
+                reflectivity=1.0,
+            ),
+            PlaneSurface(
+                "det",
+                (0.0, -2.0, 0.0),
+                (0.0, -1.0, 0.0),
+                kind="detector",
+                aperture=CircularAperture(2.0),
+            ),
+        ]
+        batch = MeasurementBatch("mirror-calib", {
+            "fold|unspecified|unpolarized": ChannelResponse(
+                reflectivity=Interval(0.8, 0.9),
+                absorptivity=Interval(0.1, 0.2),
+            ),
+        })
+        project = Project(
+            "mirror",
+            surfaces,
+            self.materials,
+            measurements=MeasurementBook([batch]),
+        )
+        result = project.trace_rays([Ray((-2.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        summary = result.detector_summary()["det"]
+        self.assertAlmostEqual(summary["power"], 0.85, places=12)
+        self.assertEqual([round(v, 12) for v in summary["power_range"]], [0.8, 0.9])
+        ledger = result.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        project.revoke_measurement("mirror-calib")
+        unknown = project.trace_rays([Ray((-2.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        self.assertEqual(unknown.status_summary(), {"unknown_response": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,13 @@
 - 探测面可用 `analyzer_angle_deg` 设置分析方向：透过能量按电场在分析轴上的投影计算，未透过部分记为 `analyzer_rejected`，与表面吸收（`absorbed`/`material_loss`）、体损耗（`bulk_loss`）、孔径擦边（`grazing`）分列，不混入无法追溯的差额。材料可用 `bulk_attenuation` 或逐波长的 `spectral_bulk_attenuation` 声明体损耗系数，缺失的波长响应同样保留为 `unknown_response`。
 - `compare_polarization_response()` 比较旋转输入偏振或分析方向前后的探测能量（含 `power_by_polarization` 拆分）与完整能量账差值；`detector_summary` 的 `power_by_polarization` 只是新增一种汇总视角，不改变既有批次的数值结果。旧的无偏振工程与批次 JSON 缺少偏振字段，重开后仍按原来的无偏振解释（s/p 各半）计算，能量账保持不变。
 
+## 实测响应区间与测量批次
+
+- 测量人员用 MeasurementBatch 提供一批命名测量：每个条目按 元件|波长|偏振轴 通道给出 ChannelResponse（reflectivity / transmissivity / absorptivity 的 Interval 区间）。三项中至少测两项，第三项由能量约束精确补全；上界会按其它通道下界收紧，R+T+A 恒满足能量约束，独立取各通道上界不会得到超过输入的总能量。下界之和超过 1 或吸收区间与 1-R-T 不相交会在构造时抛出 InconsistentMeasurement。
+- Project.measurements 是 MeasurementBook：保存所有测量批次（含互相不一致、互斥条件的多批），active 列表按优先级决定每个通道采用哪一批，并记录每个值来自哪一批（事件中的 measurement_batch / measurement_batches 与 TraceBatch.measurement_basis 的批次名和摘要）。compare_measurement_batches(a, b, rays) 在各自单独激活下追迹并比较探测能量与区间；revoke_measurement(name) 撤销一批后重新计算，被撤销批次覆盖的通道变为 unknown_response，绝不默认为无损透过；批次数据仍归档在工程内，旧工程与旧批次 JSON 重开后仍指向原测量依据。
+- 不确定量以仿射形式传播：每个实测区间是共享符号，分束后再次汇合到同一探测面时同源不确定量相互抵消，而不是当作独立误差相加（detector_summary 的 power_range 由仿射和求得；例如 R∈[0.4,0.6]、T=1-R 的分束汇合后总能量区间退化为确定值）。传播结果据此区分三类：确定能量（weight_range 为 None）、可能能量范围（RayResult.weight_range / weight_terms、事件的 *_power_range 与 *_interval、能量账 detected_range）、无法确定的分量（unknown_response 与能量账 unknown_response 桶）。缺测通道不会插值或默认无损。
+- 未在任何测量批次中出现的元件保持原有标量行为；只要某批次测量过该元件（即使后来被撤销），该元件就走实测区间路径，缺测即 unknown_response。测量批次随工程一起保存/重开，重开后按相同的 active 集合重现相同区间。
+
 ## 简化假设
 
 线偏振分量传播与材料体损耗已按上一节实现；下列其余简化仍然适用。

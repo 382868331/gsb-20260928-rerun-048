@@ -9,6 +9,7 @@ from typing import Any
 import warnings
 
 from .materials import MaterialLibrary
+from .measurements import AffineForm, MeasurementBook
 from .surfaces import CircularAperture, SphericalSurface, PlaneSurface, Surface
 from .tracer import Ray, RayResult, RayTracer, TraceSettings
 
@@ -47,6 +48,9 @@ class Project:
     surfaces: list[Surface]
     materials: MaterialLibrary = field(default_factory=MaterialLibrary)
     settings: TraceSettings = field(default_factory=TraceSettings)
+    # Measured element responses (interval batches).  An empty book keeps
+    # the legacy deterministic-scalar behaviour for every surface.
+    measurements: MeasurementBook = field(default_factory=MeasurementBook)
     description: str = "Scalar-index, geometric-optics educational model"
     # Current convention: ``reflectivity`` is always the reflected power
     # fraction.  Projects saved before this convention stored the forward
@@ -66,6 +70,7 @@ class Project:
             "migration_notes": self.migration_notes,
             "settings": vars(self.settings),
             "materials": self.materials.to_dict(),
+            "measurements": self.measurements.to_dict(),
             "surfaces": [_surface_to_dict(surface) for surface in self.surfaces],
         }
 
@@ -98,6 +103,7 @@ class Project:
             description=data.get("description", ""),
             settings=TraceSettings(**data.get("settings", {})),
             materials=MaterialLibrary.from_dict(data["materials"]),
+            measurements=MeasurementBook.from_dict(data.get("measurements")),
             surfaces=[_surface_from_dict(item) for item in surface_data],
             convention="physical-reflected-fraction-v1",
             migration_notes=new_notes + list(data.get("migration_notes", [])),
@@ -115,8 +121,61 @@ class Project:
         return project
 
     def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
-        tracer = RayTracer(self.surfaces, self.materials, self.settings)
-        return TraceBatch(project_name=self.name, rays=rays, results=tracer.trace_branches(rays))
+        tracer = RayTracer(self.surfaces, self.materials, self.settings, self.measurements)
+        basis = self.measurements.basis() if self.measurements.batches else None
+        return TraceBatch(
+            project_name=self.name,
+            rays=rays,
+            results=tracer.trace_branches(rays),
+            measurement_basis=basis,
+        )
+
+    def revoke_measurement(self, name: str) -> dict:
+        """Deactivate one measurement batch and return the new basis.
+
+        The batch data stays archived in the project, so previously saved
+        projects and trace batches still point at the original measurement
+        basis; only new traces stop using it.  Channels no longer covered by
+        any active batch trace as unknown_response rather than silently
+        falling back to a lossless default.
+        """
+
+        self.measurements.revoke(name)
+        return self.measurements.basis()
+
+    def compare_measurement_batches(self, name_a: str, name_b: str, rays: list[Ray]) -> dict:
+        """Trace the same rays under two mutually exclusive batches.
+
+        Each side activates exactly one batch, so inconsistent campaigns can
+        be compared detector by detector, including the possible power
+        ranges.  Returns the two batches plus the detector comparison.
+        """
+
+        traced = {}
+        for name in (name_a, name_b):
+            if name not in self.measurements.batches:
+                raise KeyError(f"unknown measurement batch {name!r}")
+            book = MeasurementBook(
+                list(self.measurements.batches.values()), active=[name]
+            )
+            tracer = RayTracer(self.surfaces, self.materials, self.settings, book)
+            traced[name] = TraceBatch(
+                project_name=self.name,
+                rays=rays,
+                results=tracer.trace_branches(rays),
+                measurement_basis=book.basis(),
+            )
+        return {
+            "batches": traced,
+            "detectors": traced[name_a].compare_detector_power(traced[name_b]),
+            "power_ranges": {
+                name: {
+                    detector: summary["power_range"]
+                    for detector, summary in batch.detector_summary().items()
+                }
+                for name, batch in traced.items()
+            },
+        }
 
 
 def _ray_to_dict(ray: Ray) -> dict[str, Any]:
@@ -166,6 +225,10 @@ class TraceBatch:
     project_name: str
     rays: list[Ray]
     results: list[RayResult]
+    # Provenance of the measured responses this batch was traced with;
+    # saved batches keep pointing at their original measurement basis even
+    # after the project revokes or supersedes a batch.
+    measurement_basis: dict | None = None
 
     def status_summary(self) -> dict[str, int]:
         summary: dict[str, int] = {}
@@ -188,6 +251,7 @@ class TraceBatch:
                 "path": [event["action"] for event in result.events],
                 "point": result.endpoint,
                 "power": result.weight,
+                "power_range": result.weight_range,
                 "wavelength_nm": result.wavelength_nm,
                 "polarization": result.polarization,
             })
@@ -202,8 +266,30 @@ class TraceBatch:
                 grouped.setdefault(hit["source_label"], []).append({**hit, "detector": detector})
         return grouped
 
+    def _detector_power_ranges(self) -> dict[str, list[float]]:
+        """Possible detector power range with source correlation preserved.
+
+        Hits landing on the same detector are summed as affine forms, so
+        uncertainty symbols shared by split-and-recombined beams cancel
+        instead of being added as independent error.
+        """
+
+        totals: dict[str, AffineForm] = {}
+        for result in self.results:
+            if result.status != "reached_image" or result.detector is None:
+                continue
+            totals[result.detector] = (
+                totals.get(result.detector, AffineForm.constant(0.0))
+                + result.weight_affine()
+            )
+        return {
+            detector: list(total.to_interval())
+            for detector, total in totals.items()
+        }
+
     def detector_summary(self) -> dict[str, dict[str, Any]]:
         summaries: dict[str, dict[str, Any]] = {}
+        power_ranges = self._detector_power_ranges()
         for detector, hits in self.detector_hits().items():
             total_power = sum(hit["power"] for hit in hits)
             by_source: dict[str, float] = {}
@@ -222,6 +308,7 @@ class TraceBatch:
                 )
             summaries[detector] = {
                 "power": total_power,
+                "power_range": power_ranges.get(detector, [total_power, total_power]),
                 "power_by_source": by_source,
                 "power_by_wavelength": by_wavelength,
                 "power_by_polarization": by_polarization,
@@ -347,6 +434,7 @@ class TraceBatch:
             accounts.setdefault(result.source_label, {
                 "input": 0.0,
                 "detected": 0.0,
+                "detected_range": None,
                 "absorbed": 0.0,
                 "material_loss": 0.0,
                 "bulk_loss": 0.0,
@@ -390,6 +478,17 @@ class TraceBatch:
                 wavelength_account[bucket] += result.weight
             wavelength_account["input"] += result.weight
 
+        detected_affine: dict[str, AffineForm] = {}
+        for result in self.results:
+            if result.status != "reached_image":
+                continue
+            detected_affine[result.source_label] = (
+                detected_affine.get(result.source_label, AffineForm.constant(0.0))
+                + result.weight_affine()
+            )
+        for source, affine in detected_affine.items():
+            if not affine.is_definite:
+                accounts[source]["detected_range"] = list(affine.to_interval())
         for source, account in accounts.items():
             account["absorbed"] = absorbed.get(source, 0.0)
             account["material_loss"] = account["absorbed"]
@@ -545,6 +644,7 @@ class TraceBatch:
     def to_dict(self) -> dict[str, Any]:
         return {
             "project_name": self.project_name,
+            "measurement_basis": self.measurement_basis,
             "rays": [_ray_to_dict(ray) for ray in self.rays],
             "results": [
                 {
@@ -572,10 +672,12 @@ class TraceBatch:
                 depth=item.get("depth", len(item["events"])),
                 wavelength_nm=item.get("wavelength_nm", item["ray"].get("wavelength_nm")),
                 polarization=item.get("polarization"),
+                weight_range=tuple(item["weight_range"]) if item.get("weight_range") else None,
+                weight_terms=item.get("weight_terms"),
             )
             for item in data["results"]
         ]
-        return cls(data["project_name"], rays, results)
+        return cls(data["project_name"], rays, results, data.get("measurement_basis"))
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")

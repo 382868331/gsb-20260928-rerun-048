@@ -1,6 +1,14 @@
 """Minimal geometric ray-tracing core for educational optical models."""
 
 from .materials import Material, MaterialLibrary, UnknownMaterialResponse
+from .measurements import (
+    AffineForm,
+    ChannelResponse,
+    InconsistentMeasurement,
+    Interval,
+    MeasurementBatch,
+    MeasurementBook,
+)
 from .project import Project, TraceBatch, load_batch, load_project
 from .surfaces import (
     CircularAperture,
@@ -11,7 +19,13 @@ from .surfaces import (
 from .tracer import Ray, RayResult, RayTracer, TraceSettings
 
 __all__ = [
+    "AffineForm",
+    "ChannelResponse",
     "CircularAperture",
+    "InconsistentMeasurement",
+    "Interval",
+    "MeasurementBatch",
+    "MeasurementBook",
     "Material",
     "MaterialLibrary",
     "PlaneSurface",
