@@ -15,6 +15,7 @@ from typing import Any
 
 from .materials import MaterialLibrary, UnknownMaterialResponse, fresnel_coefficients
 from .materials import fresnel_amplitudes
+from .measurements import AffineQuantity, MeasurementBatch
 from .surfaces import Surface, add, cross, dot, normalize, scale
 
 
@@ -170,13 +171,25 @@ class RayResult:
     depth: int = 0
     wavelength_nm: float | None = None
     polarization: float | None = None
+    # Serialized AffineQuantity ({constant, coeffs}) when the terminal power
+    # depends on measured response intervals; None means fully determined.
+    weight_uncertainty: dict | None = None
 
 
 class RayTracer:
-    def __init__(self, surfaces: list[Surface], materials: MaterialLibrary, settings: TraceSettings | None = None):
+    def __init__(self, surfaces: list[Surface], materials: MaterialLibrary, settings: TraceSettings | None = None,
+                 measurements: MeasurementBatch | None = None):
         self.surfaces = surfaces
         self.materials = materials
         self.settings = settings or TraceSettings()
+        self.measurements = measurements
+        self._noise_counter = 0
+
+    def _noise(self) -> str:
+        """Fresh symbol bounding one nonlinear product term."""
+
+        self._noise_counter += 1
+        return f"nonlinear:{self._noise_counter}"
 
     def trace(self, ray: Ray) -> RayResult:
         leaves = self.trace_branches([ray])
@@ -209,6 +222,7 @@ class RayTracer:
     def trace_branches(self, rays: list[Ray]) -> list[RayResult]:
         """Trace every source ray and return all terminal sub-beams."""
 
+        self._noise_counter = 0
         leaves: list[RayResult] = []
         for source_index, source_ray in enumerate(rays):
             normalized = source_ray.normalized()
@@ -255,6 +269,7 @@ class RayTracer:
                 "events": [],
                 "last_surface": None,
                 "saw_tir": False,
+                "weight_affine": AffineQuantity(seed.weight),
             }
         ]
         leaves: list[RayResult] = []
@@ -337,7 +352,11 @@ class RayTracer:
             if propagation_loss > 0.0:
                 weight -= propagation_loss
                 current = replace(current, weight=weight)
-                state = {**state, "ray": current}
+                state = {
+                    **state,
+                    "ray": current,
+                    "weight_affine": state["weight_affine"].scale(math.exp(-attenuation * t)),
+                }
                 event["incident_weight"] = weight
             event["medium"] = medium_name
             event["propagation_distance"] = t
@@ -370,7 +389,11 @@ class RayTracer:
                         "analyzer_rejected_power": weight - transmitted,
                     })
                     current = replace(current, weight=transmitted)
-                    state = {**state, "ray": current}
+                    state = {
+                        **state,
+                        "ray": current,
+                        "weight_affine": state["weight_affine"].scale(fraction),
+                    }
                 event["event_uid"] = event_counter
                 event_counter += 1
                 leaves.append(self._finish(seed, state, event, "reached_image", point, surface.identifier))
@@ -399,6 +422,144 @@ class RayTracer:
             if surface.kind == "beamsplitter":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 transmitted = tuple(incident)
+                measured_split = self._measured_split(surface, current)
+                if measured_split is not None:
+                    # Measured interval responses: fractions are affine
+                    # quantities over shared uncertainty symbols, so beams
+                    # recombined later keep their correlation.  A channel
+                    # the batch does not cover ends as unknown instead of
+                    # defaulting to lossless transmission.
+                    (
+                        reflected_fraction_aff,
+                        transmitted_fraction_aff,
+                        reflected_field,
+                        transmitted_field,
+                        s_fraction,
+                        unknown_channels,
+                    ) = self._polarized_split_affine(surface, incident, normal, current, measured_split)
+                    weight_affine = state["weight_affine"]
+                    reflected_affine = (
+                        weight_affine.mul(reflected_fraction_aff, self._noise())
+                        if reflected_fraction_aff is not None else None
+                    )
+                    transmitted_affine = (
+                        weight_affine.mul(transmitted_fraction_aff, self._noise())
+                        if transmitted_fraction_aff is not None else None
+                    )
+                    known_affine = AffineQuantity(0.0)
+                    if reflected_affine is not None:
+                        known_affine = known_affine + reflected_affine
+                    if transmitted_affine is not None:
+                        known_affine = known_affine + transmitted_affine
+                    remainder_affine = weight_affine - known_affine
+                    remainder_interval = remainder_affine.interval()
+                    joint_note = None
+                    if unknown_channels:
+                        absorbed_affine = None
+                        absorbed_power = 0.0
+                    else:
+                        absorbed_affine = remainder_affine
+                        absorbed_power = remainder_affine.constant
+                        if remainder_interval[0] < 0.0:
+                            # The measured R/T intervals allow corners with
+                            # R + T > 1; absorption cannot be negative, so
+                            # the joint constraint clips that corner.
+                            joint_note = (
+                                "joint energy constraint R+T<=1 clips the "
+                                "absorbed interval at 0"
+                            )
+                            absorbed_power = max(0.0, absorbed_power)
+                    reflected_weight = reflected_affine.constant if reflected_affine is not None else 0.0
+                    transmitted_weight = transmitted_affine.constant if transmitted_affine is not None else 0.0
+                    symbols: set[str] = set()
+                    for quantity in (reflected_affine, transmitted_affine, remainder_affine):
+                        if quantity is not None:
+                            symbols.update(quantity.symbols)
+                    event.update({
+                        "action": "split",
+                        "cosine_incidence": cosine,
+                        "reflectivity": reflected_fraction_aff.constant if reflected_fraction_aff else None,
+                        "transmissivity": transmitted_fraction_aff.constant if transmitted_fraction_aff else None,
+                        "polarization_s_fraction": s_fraction,
+                        "measurement_batch": self.measurements.batch_id,
+                        "reflectivity_interval": (
+                            list(reflected_fraction_aff.interval()) if reflected_fraction_aff else None
+                        ),
+                        "transmissivity_interval": (
+                            list(transmitted_fraction_aff.interval()) if transmitted_fraction_aff else None
+                        ),
+                        "unknown_channels": unknown_channels,
+                        "reflected_power": reflected_weight,
+                        "transmitted_power": transmitted_weight,
+                        "absorbed_power": absorbed_power,
+                        "reflected_power_interval": list(reflected_affine.interval()) if reflected_affine else None,
+                        "transmitted_power_interval": list(transmitted_affine.interval()) if transmitted_affine else None,
+                        "absorbed_power_interval": (
+                            [max(0.0, absorbed_affine.interval()[0]), absorbed_affine.interval()[1]]
+                            if absorbed_affine is not None else None
+                        ),
+                        "uncertainty_symbols": sorted(symbols),
+                        "transmitted_direction": transmitted,
+                        "reflected_direction": reflected,
+                        "outgoing_direction": transmitted,
+                        "outgoing_weight": transmitted_weight,
+                    })
+                    if joint_note is not None:
+                        event["joint_energy_constraint"] = joint_note
+                    event["event_uid"] = event_counter
+                    event_counter += 1
+                    base_events = self._extended_events(events, event, state["branch_id"], event_counter - 1)
+                    next_depth = state["depth"] + 1
+                    common = {
+                        "last_surface": surface.identifier,
+                        "depth": next_depth,
+                        "saw_tir": state["saw_tir"],
+                    }
+                    children = []
+                    if reflected_affine is not None and reflected_weight > 0.0:
+                        children.append({
+                            **common,
+                            "events": list(base_events),
+                            "ray": replace(
+                                current,
+                                origin=self._offset(point, reflected),
+                                direction=reflected,
+                                weight=reflected_weight,
+                                polarization=reflected_field,
+                            ),
+                            "weight_affine": reflected_affine,
+                            "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
+                            "parent_branch_id": state["branch_id"],
+                        })
+                    if transmitted_affine is not None and transmitted_weight > 0.0:
+                        children.append({
+                            **common,
+                            "events": list(base_events),
+                            "ray": replace(
+                                current,
+                                origin=self._offset(point, transmitted),
+                                direction=transmitted,
+                                weight=transmitted_weight,
+                                polarization=transmitted_field,
+                            ),
+                            "weight_affine": transmitted_affine,
+                            "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
+                            "parent_branch_id": state["branch_id"],
+                        })
+                    pending.extend(children)
+                    if unknown_channels:
+                        unknown_state = {
+                            **common,
+                            "events": list(base_events),
+                            "ray": replace(current, weight=max(0.0, remainder_affine.constant)),
+                            "weight_affine": remainder_affine,
+                            "branch_id": f"{state['branch_id']}.{len(base_events)}.u",
+                            "parent_branch_id": state["branch_id"],
+                        }
+                        leaves.append(self._leaf(seed, unknown_state, "unknown_response", point, None))
+                    elif not children:
+                        leaves.append(self._finish(seed, state, event, "absorbed", point, None))
+                    continue
                 # reflectivity always means the reflected power fraction,
                 # matching mirrors; transmission defaults to the lossless
                 # complement and may be set explicitly.  Polarization
@@ -463,6 +624,7 @@ class RayTracer:
                             weight=reflected_weight,
                             polarization=reflected_field,
                         ),
+                        "weight_affine": state["weight_affine"].scale(reflected_fraction),
                         "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
                         "parent_branch_id": state["branch_id"],
                     })
@@ -477,6 +639,7 @@ class RayTracer:
                             weight=transmitted_weight,
                             polarization=transmitted_field,
                         ),
+                        "weight_affine": state["weight_affine"].scale(transmitted_fraction),
                         "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
                         "parent_branch_id": state["branch_id"],
                     })
@@ -490,8 +653,43 @@ class RayTracer:
 
             if surface.kind == "mirror":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
-                absorbed = weight * (1.0 - surface.reflectivity)
-                new_weight = weight * surface.reflectivity
+                measured_reflectivity = None
+                if self.measurements is not None and surface.identifier in self.measurements.surfaces_declared():
+                    measured_reflectivity = self.measurements.interval(
+                        surface.identifier, "reflectivity", current.wavelength_nm, None
+                    )
+                    if measured_reflectivity is None:
+                        event.update({
+                            "action": "unknown_measured_response",
+                            "measurement_batch": self.measurements.batch_id,
+                            "reason": (
+                                f"measurement batch {self.measurements.batch_id!r} declares"
+                                f" {surface.identifier!r} without a reflectivity interval"
+                            ),
+                            "final_direction": incident,
+                            "absorbed_power": 0.0,
+                        })
+                        event["event_uid"] = event_counter
+                        event_counter += 1
+                        leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                        continue
+                if measured_reflectivity is not None:
+                    new_affine = state["weight_affine"].mul(measured_reflectivity, self._noise())
+                    absorbed_affine = state["weight_affine"] - new_affine
+                    absorbed_interval = absorbed_affine.interval()
+                    new_weight = new_affine.constant
+                    absorbed = max(0.0, absorbed_affine.constant)
+                    event.update({
+                        "measurement_batch": self.measurements.batch_id,
+                        "reflectivity_interval": list(measured_reflectivity.interval()),
+                        "reflected_power_interval": list(new_affine.interval()),
+                        "absorbed_power_interval": [max(0.0, absorbed_interval[0]), absorbed_interval[1]],
+                        "uncertainty_symbols": sorted(new_affine.symbols),
+                    })
+                else:
+                    new_affine = state["weight_affine"].scale(surface.reflectivity)
+                    absorbed = weight * (1.0 - surface.reflectivity)
+                    new_weight = weight * surface.reflectivity
                 event.update({
                     "action": "reflect",
                     "cosine_incidence": cosine,
@@ -511,7 +709,10 @@ class RayTracer:
                         weight=new_weight,
                         polarization=self._reflect_field(current, normal),
                     )
-                    pending.append(self._advance(state, event, outgoing, surface.identifier, state["saw_tir"], event_counter - 1))
+                    pending.append(self._advance(
+                        state, event, outgoing, surface.identifier, state["saw_tir"],
+                        event_counter - 1, weight_affine=new_affine,
+                    ))
                 else:
                     leaves.append(self._finish(seed, state, event, "absorbed", point, None))
                 continue
@@ -632,6 +833,7 @@ class RayTracer:
                     **common,
                     "events": list(base_events),
                     "ray": reflected_ray,
+                    "weight_affine": state["weight_affine"].scale(reflected_fraction),
                     "branch_id": f"{state['branch_id']}.{len(base_events)}.r",
                     "parent_branch_id": state["branch_id"],
                 })
@@ -646,6 +848,7 @@ class RayTracer:
                 **common,
                 "events": list(base_events),
                 "ray": transmitted_ray,
+                "weight_affine": state["weight_affine"].scale(transmitted_fraction),
                 "branch_id": f"{state['branch_id']}.{len(base_events)}.t",
                 "parent_branch_id": state["branch_id"],
             })
@@ -660,7 +863,8 @@ class RayTracer:
         return [*events, recorded]
 
     @staticmethod
-    def _advance(state: dict[str, Any], event: dict[str, Any], ray: Ray, surface_identifier: str, saw_tir: bool, event_uid: int) -> dict[str, Any]:
+    def _advance(state: dict[str, Any], event: dict[str, Any], ray: Ray, surface_identifier: str, saw_tir: bool, event_uid: int,
+                 weight_affine: "AffineQuantity | None" = None) -> dict[str, Any]:
         return {
             "ray": ray,
             "branch_id": state["branch_id"],
@@ -669,10 +873,12 @@ class RayTracer:
             "events": RayTracer._extended_events(state["events"], event, state["branch_id"], event_uid),
             "last_surface": surface_identifier,
             "saw_tir": saw_tir,
+            "weight_affine": weight_affine if weight_affine is not None else state.get("weight_affine"),
         }
 
     @staticmethod
     def _leaf(seed: Ray, state: dict[str, Any], status: str, endpoint, detector: str | None = None) -> RayResult:
+        affine = state.get("weight_affine")
         return RayResult(
             ray=seed,
             status=status,
@@ -686,6 +892,9 @@ class RayTracer:
             depth=state["depth"],
             wavelength_nm=seed.wavelength_nm,
             polarization=seed.polarization_angle_deg,
+            weight_uncertainty=(
+                affine.to_dict() if (affine is not None and not affine.is_certain) else None
+            ),
         )
 
     def _finish(self, seed: Ray, state: dict[str, Any], event: dict[str, Any], status: str, point, detector: str | None) -> RayResult:
@@ -774,6 +983,93 @@ class RayTracer:
             ray.polarization,
         )
         return reflected_fraction, transmitted_fraction, reflected_field, transmitted_field, s_fraction
+
+    def _measured_split(self, surface: Surface, ray: Ray):
+        """Per-axis measured interval split, or None when nothing is declared.
+
+        When the active batch measures two of reflectivity/transmissivity/
+        absorptivity for a channel, the third follows from energy
+        conservation over the *same* symbols, keeping the correlation.
+        """
+
+        batch = self.measurements
+        if batch is None or surface.identifier not in batch.surfaces_declared():
+            return None
+        one = AffineQuantity(1.0)
+        split = {}
+        for axis in ("s", "p"):
+            reflectivity = batch.interval(surface.identifier, "reflectivity", ray.wavelength_nm, axis)
+            transmissivity = batch.interval(surface.identifier, "transmissivity", ray.wavelength_nm, axis)
+            absorptivity = batch.interval(surface.identifier, "absorptivity", ray.wavelength_nm, axis)
+            if transmissivity is None and reflectivity is not None and absorptivity is not None:
+                transmissivity = one - reflectivity - absorptivity
+            if reflectivity is None and transmissivity is not None and absorptivity is not None:
+                reflectivity = one - transmissivity - absorptivity
+            split[axis] = (reflectivity, transmissivity)
+        return split
+
+    def _polarized_split_affine(self, surface, incident, normal, ray: Ray, measured_split):
+        """Affine beamsplitter fractions from measured intervals.
+
+        A fraction is None when any polarization axis the ray actually
+        carries has no measured response for it; the caller terminates
+        that share as unknown rather than assuming lossless transmission.
+        """
+
+        (r_s, t_s), (r_p, t_p) = measured_split["s"], measured_split["p"]
+
+        def combine(first, second, w_s, w_p):
+            if first is None or second is None:
+                return None
+            return first.scale(w_s) + second.scale(w_p)
+
+        if ray.polarization is None:
+            s_fraction = 0.5
+            reflected_fraction = combine(r_s, r_p, 0.5, 0.5)
+            transmitted_fraction = combine(t_s, t_p, 0.5, 0.5)
+            unknown_channels = []
+            if reflected_fraction is None:
+                unknown_channels.append("reflectivity")
+            if transmitted_fraction is None:
+                unknown_channels.append("transmissivity")
+            return reflected_fraction, transmitted_fraction, None, None, s_fraction, unknown_channels
+
+        s_axis, p_axis = self._sp_basis(incident, normal)
+        e_s = dot(ray.polarization, s_axis)
+        e_p = dot(ray.polarization, p_axis)
+        s_fraction = e_s * e_s
+        p_fraction = e_p * e_p
+        reflected_fraction = combine(r_s, r_p, s_fraction, p_fraction)
+        transmitted_fraction = combine(t_s, t_p, s_fraction, p_fraction)
+        unknown_channels = []
+        if reflected_fraction is None:
+            unknown_channels.append("reflectivity")
+        if transmitted_fraction is None:
+            unknown_channels.append("transmissivity")
+        reflected = self._reflect(incident, scale(normal, -1.0))
+        reflected_p_axis = normalize(cross(s_axis, reflected))
+        reflected_field = None
+        if reflected_fraction is not None:
+            reflected_field = self._combine_field(
+                e_s * math.sqrt(r_s.constant), s_axis,
+                e_p * math.sqrt(r_p.constant), reflected_p_axis,
+                ray.polarization,
+            )
+        transmitted_field = None
+        if transmitted_fraction is not None:
+            transmitted_field = self._combine_field(
+                e_s * math.sqrt(t_s.constant), s_axis,
+                e_p * math.sqrt(t_p.constant), p_axis,
+                ray.polarization,
+            )
+        return (
+            reflected_fraction,
+            transmitted_fraction,
+            reflected_field,
+            transmitted_field,
+            s_fraction,
+            unknown_channels,
+        )
 
     def _polarized_fresnel(self, n1, n2, cos_i, incident, normal, refracted, reflected, ray: Ray):
         """Fresnel split for a linearly polarized ray (lossless interface)."""

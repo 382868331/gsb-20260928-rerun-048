@@ -938,5 +938,253 @@ class PolarizationTests(unittest.TestCase):
             places=12,
         )
 
+class MeasuredResponseTests(unittest.TestCase):
+    """Interval-valued measured responses with provenance and correlation."""
+
+    @staticmethod
+    def _splitter_project():
+        a = math.sqrt(0.5)
+        surfaces = [
+            PlaneSurface("splitter", (0.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(5.0)),
+            PlaneSurface("det_transmitted", (2.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(3.0)),
+            PlaneSurface("det_reflected", (0.0, -2.0, 0.0), (0.0, -1.0, 0.0),
+                         kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        return Project("measured-splitter", surfaces, MaterialLibrary())
+
+    def test_partial_measurement_stays_unknown_not_lossless(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        project = self._splitter_project()
+        # Only reflectivity is measured; transmission was never measured.
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-1",
+            measurements=(
+                ResponseMeasurement("splitter", "reflectivity", 0.3, 0.5),
+            ),
+        ))
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+
+        summary = batch.detector_summary()
+        self.assertAlmostEqual(summary["det_reflected"]["power"], 0.4, places=12)
+        self.assertEqual(
+            tuple(round(v, 12) for v in summary["det_reflected"]["power_interval"]),
+            (0.3, 0.5),
+        )
+        # The unmeasured transmitted share is not silently delivered.
+        self.assertNotIn("det_transmitted", summary)
+        self.assertEqual(batch.status_summary().get("unknown_response"), 1)
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unknown_response"], 0.6, places=12)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+
+        uncertainty = batch.uncertainty_summary()["src"]
+        self.assertEqual(uncertainty["certain"], 0.0)
+        self.assertEqual(
+            tuple(round(v, 12) for v in uncertainty["possible"]["interval"]),
+            (0.3, 0.5),
+        )
+        self.assertAlmostEqual(uncertainty["unknown"], 0.6, places=12)
+        self.assertEqual(
+            tuple(round(v, 12) for v in uncertainty["unknown_interval"]),
+            (0.5, 0.7),
+        )
+        split_event = next(
+            event for leaf in batch.results for event in leaf.events
+            if event["action"] == "split"
+        )
+        self.assertEqual(split_event["unknown_channels"], ["transmissivity"])
+        self.assertEqual(split_event["measurement_batch"], "crew-1")
+
+    def test_unmeasured_wavelength_channel_is_unknown(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        project = self._splitter_project()
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-450",
+            measurements=(
+                ResponseMeasurement("splitter", "reflectivity", 0.3, 0.5, wavelength_nm=450.0),
+                ResponseMeasurement("splitter", "absorptivity", 0.0, 0.0, wavelength_nm=450.0),
+            ),
+        ))
+        ray = Ray.spectral((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="src")
+        batch = project.trace_rays([ray])
+
+        by_wavelength = {
+            leaf.wavelength_nm: leaf for leaf in batch.results
+            if leaf.status == "unknown_response"
+        }
+        # 650 nm has no verified response at all: the whole component is
+        # undeterminable instead of borrowing the 450 nm interval.
+        self.assertIn(650.0, by_wavelength)
+        self.assertAlmostEqual(by_wavelength[650.0].weight, 0.5, places=12)
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+        detected = batch.detector_summary()
+        self.assertAlmostEqual(
+            detected["det_transmitted"]["power_by_wavelength"]["450 nm"], 0.3, places=12
+        )
+
+    def test_recombined_branches_keep_correlation(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        a = math.sqrt(0.5)
+        surfaces = [
+            PlaneSurface("splitter1", (0.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(0.5)),
+            PlaneSurface("mirror_top", (3.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(0.5)),
+            PlaneSurface("mirror_side", (0.0, -2.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(0.5)),
+            PlaneSurface("splitter2", (3.0, -2.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(0.5),
+                         reflectivity=0.5),
+            PlaneSurface("detector", (5.0, -2.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        project = Project("mach-zehnder", surfaces, MaterialLibrary())
+        # r in [0.3, 0.5] with zero measured absorption: t = 1 - r over the
+        # same uncertainty symbol.
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-mz",
+            measurements=(
+                ResponseMeasurement("splitter1", "reflectivity", 0.3, 0.5),
+                ResponseMeasurement("splitter1", "absorptivity", 0.0, 0.0),
+            ),
+        ))
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+
+        summary = batch.detector_summary()["detector"]
+        self.assertEqual(summary["count"], 2)
+        self.assertAlmostEqual(summary["power"], 0.5, places=12)
+        # 0.5*(r + (1 - r)): the shared symbol cancels exactly, so the
+        # recombined total is certain even though each path is uncertain.
+        low, high = summary["power_interval"]
+        self.assertAlmostEqual(low, 0.5, places=12)
+        self.assertAlmostEqual(high, 0.5, places=12)
+
+        uncertainty = batch.uncertainty_summary()["src"]
+        low, high = uncertainty["possible"]["interval"]
+        self.assertAlmostEqual(low, 0.5, places=12)
+        self.assertAlmostEqual(high, 0.5, places=12)
+        self.assertFalse(uncertainty["possible"]["clipped_by_energy_constraint"])
+        self.assertTrue(uncertainty["shared_symbols"])
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+
+    def test_joint_energy_constraint_clips_impossible_total(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        project = self._splitter_project()
+        # Independently measured R and T whose upper bounds exceed 1.
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-wide",
+            measurements=(
+                ResponseMeasurement("splitter", "reflectivity", 0.4, 0.6),
+                ResponseMeasurement("splitter", "transmissivity", 0.4, 0.6),
+            ),
+        ))
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+
+        split_event = next(
+            event for leaf in batch.results for event in leaf.events
+            if event["action"] == "split"
+        )
+        self.assertIn("joint_energy_constraint", split_event)
+        self.assertEqual(
+            [round(v, 12) for v in split_event["absorbed_power_interval"]],
+            [0.0, 0.2],
+        )
+        uncertainty = batch.uncertainty_summary()["src"]
+        # Raw R+T reaches 1.2; the joint constraint clips the total to the
+        # physical input instead of reporting impossible energy.
+        self.assertEqual(
+            tuple(round(v, 12) for v in uncertainty["possible"]["interval"]),
+            (0.8, 1.0),
+        )
+        self.assertTrue(uncertainty["possible"]["clipped_by_energy_constraint"])
+
+    def test_conflicting_batches_revoke_and_provenance_survive_reopen(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement, load_batch
+        project = self._splitter_project()
+        common = (
+            ResponseMeasurement("splitter", "absorptivity", 0.0, 0.0),
+        )
+        project.add_measurement_batch(MeasurementBatch(
+            "lot-a",
+            measurements=(ResponseMeasurement("splitter", "reflectivity", 0.2, 0.3),) + common,
+        ))
+        project.add_measurement_batch(MeasurementBatch(
+            "lot-b",
+            measurements=(ResponseMeasurement("splitter", "reflectivity", 0.6, 0.7),) + common,
+        ))
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+
+        conflicts = project.measurement_conflicts()
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["batches"], ["lot-a", "lot-b"])
+
+        batch_a = project.trace_with_measurements("lot-a", rays)
+        comparison = project.compare_measurement_batches("lot-a", "lot-b", rays)
+        delta = comparison["detectors"]["det_reflected"]["delta"]
+        self.assertAlmostEqual(delta, 0.65 - 0.25, places=12)
+
+        with tempfile.TemporaryDirectory() as directory:
+            batch_path = Path(directory) / "batch-a.json"
+            project_path = Path(directory) / "project.json"
+            batch_a.save(batch_path)
+            project.revoke_measurement_batch("lot-a")
+            project.save(project_path)
+
+            # The revoked batch stays on record and the old trace batch
+            # still points at its original measurement basis.
+            reopened_batch = load_batch(batch_path)
+            self.assertEqual(reopened_batch.measurement_batch_id, "lot-a")
+            reopened_project = Project.load(project_path)
+            self.assertTrue(reopened_project.measurement_batches["lot-a"].revoked)
+            self.assertEqual(reopened_project.active_measurement_batch, "lot-b")
+            self.assertEqual(reopened_project.measurement_conflicts(), [])
+
+            recalculated = reopened_project.trace_rays(rays)
+            self.assertEqual(recalculated.measurement_batch_id, "lot-b")
+            self.assertAlmostEqual(
+                recalculated.detector_summary()["det_reflected"]["power"], 0.65, places=12
+            )
+            # Auditing the revoked batch still reproduces the old numbers.
+            audited = reopened_project.trace_with_measurements("lot-a", rays)
+            self.assertAlmostEqual(
+                audited.detector_summary()["det_reflected"]["power"], 0.25, places=12
+            )
+            self.assertEqual(
+                audited.uncertainty_summary(), batch_a.uncertainty_summary(),
+            )
+
+    def test_measured_project_roundtrip_reproduces_uncertainty(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        project = self._splitter_project()
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-rt",
+            measurements=(
+                ResponseMeasurement("splitter", "reflectivity", 0.3, 0.5),
+                ResponseMeasurement("splitter", "absorptivity", 0.0, 0.0),
+            ),
+        ))
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        batch = project.trace_rays(rays)
+        with tempfile.TemporaryDirectory() as directory:
+            project_path = Path(directory) / "project.json"
+            batch_path = Path(directory) / "batch.json"
+            project.save(project_path)
+            batch.save(batch_path)
+            reopened_project = Project.load(project_path)
+            from raytrace import load_batch
+            reopened_batch = load_batch(batch_path)
+            recalculated = reopened_project.trace_rays(rays)
+
+        self.assertEqual(reopened_batch.measurement_batch_id, "crew-rt")
+        self.assertEqual(reopened_batch.detector_summary(), batch.detector_summary())
+        self.assertEqual(recalculated.detector_summary(), batch.detector_summary())
+        self.assertEqual(recalculated.uncertainty_summary(), batch.uncertainty_summary())
+        self.assertEqual(recalculated.energy_ledger(), batch.energy_ledger())
+
+
 if __name__ == "__main__":
     unittest.main()

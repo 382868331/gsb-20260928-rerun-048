@@ -29,6 +29,18 @@
 
 ## 简化假设
 
+## 实测响应区间与不确定量
+
+测量人员可以为光学元件提供按波长和偏振通道划分的响应**区间**，取代确定常数：
+
+- `ResponseMeasurement(surface, quantity, lower, upper, wavelength_nm=None, polarization=None)` 声明一条实测区间，`quantity` 取 `reflectivity` / `transmissivity` / `absorptivity`；`wavelength_nm=None` 表示宽波段，`polarization=None` 表示标量（s/p 共用）。查询按精确波长匹配，不用邻近值插值；同一通道测量了三个量中的两个时，第三个由能量守恒在**同一不确定符号**上推出（如 t = 1 - r - a）。
+- `MeasurementBatch(batch_id, measurements=...)` 把一批测量按来源（批次号、备注）归档；`Project.add_measurement_batch()` 登记并激活，`Project.active_measurement_batch` 决定新追迹使用哪一批。未测量的通道不会默认为无损透过：该方向份额以 `unknown_response` 终止，事件记录 `unknown_channels`，能量计入能量账的 `unknown_response` 项。
+- 传播用仿射算术跟踪不确定量：每条实测区间是一个取值 [-1, 1] 的符号，分束后再次汇合时同源符号的系数相消而不是按独立误差相加（马赫-曾德汇合中 0.5·(r+(1-r)) 保持精确）。`RayResult.weight_uncertainty` 保存每个终止分支的仿射形式，`detector_summary` 新增 `power_interval`，`TraceBatch.uncertainty_summary()` 按来源把结果分成 `certain`（确定能量）、`possible`（可能范围，含 `nominal` 与 `interval`）和 `unknown`（无法确定的分量），并列出跨分支共享的 `shared_symbols`。
+- 区间与反射、透射、吸收共同受能量约束：当实测 R、T 区间的上界之和超过 1 时，吸收区间在 0 处截断，事件记录 `joint_energy_constraint`，`uncertainty_summary` 的可能范围被裁剪到物理可达的输入能量并置 `clipped_by_energy_constraint`，不会由独立上界拼出不可能的总能量。
+- 两批测量对同一元件/通道给出不相交区间时，`Project.measurement_conflicts()` 列出互斥条件；`Project.compare_measurement_batches(id_a, id_b, rays)` 用相同输入分别追迹并比较探测能量、不确定范围与能量账；`Project.revoke_measurement_batch()` 撤销一批后可重新计算，被撤销的批次仍保留在工程档案中，`trace_with_measurements()` 可随时审计旧依据。每个 `TraceBatch` 记录 `measurement_batch_id` 溯源，保存/重开后旧工程与旧批次仍指向原测量依据。
+
+## 简化假设
+
 线偏振分量传播与材料体损耗已按上一节实现；下列其余简化仍然适用。
 
 当前模型只描述理想化几何光线：表面无限薄且局部光滑，材料使用各向同性标量折射率，透镜厚度由两个表面之间的传播隐式给出。模型不含真实制造所需的像差拟合、镀膜、公差、散射、衍射、非球面或精确孔径装配；偏振只覆盖线偏振分量的相干分解，不含相位延迟与旋光。

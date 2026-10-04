@@ -9,6 +9,7 @@ from typing import Any
 import warnings
 
 from .materials import MaterialLibrary
+from .measurements import AffineQuantity, MeasurementBatch
 from .surfaces import CircularAperture, SphericalSurface, PlaneSurface, Surface
 from .tracer import Ray, RayResult, RayTracer, TraceSettings
 
@@ -55,8 +56,101 @@ class Project:
     # are migrated audibly instead of being reinterpreted silently.
     convention: str = "physical-reflected-fraction-v1"
     migration_notes: list[str] = field(default_factory=list)
+    # Measured interval responses, keyed by batch id.  Only one batch is
+    # active for new traces; revoked batches stay recorded so older
+    # projects and trace batches keep pointing at their original
+    # measurement basis.
+    measurement_batches: dict[str, MeasurementBatch] = field(default_factory=dict)
+    active_measurement_batch: str | None = None
 
     LEGACY_CONVENTION = "legacy-beamsplitter-reflectivity-is-transmission"
+
+    def add_measurement_batch(self, batch: MeasurementBatch, activate: bool = True) -> None:
+        self.measurement_batches[batch.batch_id] = batch
+        if activate:
+            if batch.revoked:
+                raise ValueError(f"measurement batch {batch.batch_id!r} is revoked")
+            self.active_measurement_batch = batch.batch_id
+
+    def revoke_measurement_batch(self, batch_id: str) -> None:
+        """Withdraw a batch; existing provenance references stay intact."""
+
+        try:
+            batch = self.measurement_batches[batch_id]
+        except KeyError:
+            raise KeyError(f"unknown measurement batch {batch_id!r}") from None
+        batch.revoked = True
+        if self.active_measurement_batch == batch_id:
+            self.active_measurement_batch = None
+
+    def measurement_conflicts(self) -> list[dict[str, Any]]:
+        """Mutually exclusive conditions among the non-revoked batches."""
+
+        batches = [batch for batch in self.measurement_batches.values() if not batch.revoked]
+        conflicts: list[dict[str, Any]] = []
+        for index, first in enumerate(batches):
+            for second in batches[index + 1:]:
+                conflicts.extend(first.conflicts_with(second))
+        return conflicts
+
+    def active_measurements(self) -> MeasurementBatch | None:
+        if self.active_measurement_batch is None:
+            return None
+        batch = self.measurement_batches.get(self.active_measurement_batch)
+        if batch is None or batch.revoked:
+            return None
+        return batch
+
+    def trace_with_measurements(self, batch_id: str, rays: list[Ray]) -> "TraceBatch":
+        """Trace with one specific batch, even a revoked one (for audits)."""
+
+        try:
+            batch = self.measurement_batches[batch_id]
+        except KeyError:
+            raise KeyError(f"unknown measurement batch {batch_id!r}") from None
+        tracer = RayTracer(self.surfaces, self.materials, self.settings, measurements=batch)
+        return TraceBatch(
+            project_name=self.name,
+            rays=rays,
+            results=tracer.trace_branches(rays),
+            measurement_batch_id=batch_id,
+        )
+
+    def compare_measurement_batches(
+        self,
+        first_id: str,
+        second_id: str,
+        rays: list[Ray],
+        input_power: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Compare two measurement batches on identical inputs."""
+
+        first = self.trace_with_measurements(first_id, rays)
+        second = self.trace_with_measurements(second_id, rays)
+        first_uncertainty = first.uncertainty_summary(input_power)
+        second_uncertainty = second.uncertainty_summary(input_power)
+        uncertainty: dict[str, Any] = {}
+        for source in sorted(set(first_uncertainty) | set(second_uncertainty)):
+            before = first_uncertainty.get(source, {})
+            after = second_uncertainty.get(source, {})
+            uncertainty[source] = {
+                "before": {
+                    "certain": before.get("certain", 0.0),
+                    "possible": before.get("possible"),
+                    "unknown": before.get("unknown", 0.0),
+                },
+                "after": {
+                    "certain": after.get("certain", 0.0),
+                    "possible": after.get("possible"),
+                    "unknown": after.get("unknown", 0.0),
+                },
+            }
+        return {
+            "measurement_batches": [first_id, second_id],
+            "detectors": first.compare_detector_power(second),
+            "uncertainty": uncertainty,
+            "energy_ledger": first.compare_energy_ledger(second, input_power),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +161,8 @@ class Project:
             "settings": vars(self.settings),
             "materials": self.materials.to_dict(),
             "surfaces": [_surface_to_dict(surface) for surface in self.surfaces],
+            "measurement_batches": [batch.to_dict() for batch in self.measurement_batches.values()],
+            "active_measurement_batch": self.active_measurement_batch,
         }
 
     @classmethod
@@ -101,6 +197,14 @@ class Project:
             surfaces=[_surface_from_dict(item) for item in surface_data],
             convention="physical-reflected-fraction-v1",
             migration_notes=new_notes + list(data.get("migration_notes", [])),
+            measurement_batches={
+                batch.batch_id: batch
+                for batch in (
+                    MeasurementBatch.from_dict(item)
+                    for item in data.get("measurement_batches", [])
+                )
+            },
+            active_measurement_batch=data.get("active_measurement_batch"),
         )
         return project, new_notes
 
@@ -115,8 +219,14 @@ class Project:
         return project
 
     def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
-        tracer = RayTracer(self.surfaces, self.materials, self.settings)
-        return TraceBatch(project_name=self.name, rays=rays, results=tracer.trace_branches(rays))
+        measurements = self.active_measurements()
+        tracer = RayTracer(self.surfaces, self.materials, self.settings, measurements=measurements)
+        return TraceBatch(
+            project_name=self.name,
+            rays=rays,
+            results=tracer.trace_branches(rays),
+            measurement_batch_id=measurements.batch_id if measurements is not None else None,
+        )
 
 
 def _ray_to_dict(ray: Ray) -> dict[str, Any]:
@@ -166,6 +276,10 @@ class TraceBatch:
     project_name: str
     rays: list[Ray]
     results: list[RayResult]
+    # Provenance: which measurement batch produced these results.  Saved
+    # with the batch so reopened results always point at their original
+    # measurement basis, even after that batch is revoked.
+    measurement_batch_id: str | None = None
 
     def status_summary(self) -> dict[str, int]:
         summary: dict[str, int] = {}
@@ -188,6 +302,7 @@ class TraceBatch:
                 "path": [event["action"] for event in result.events],
                 "point": result.endpoint,
                 "power": result.weight,
+                "power_uncertainty": result.weight_uncertainty,
                 "wavelength_nm": result.wavelength_nm,
                 "polarization": result.polarization,
             })
@@ -206,11 +321,16 @@ class TraceBatch:
         summaries: dict[str, dict[str, Any]] = {}
         for detector, hits in self.detector_hits().items():
             total_power = sum(hit["power"] for hit in hits)
+            total_affine = AffineQuantity(0.0)
             by_source: dict[str, float] = {}
             by_wavelength: dict[str, float] = {}
             by_source_wavelength: dict[str, dict[str, float]] = {}
             by_polarization: dict[str, float] = {}
             for hit in hits:
+                affine = AffineQuantity.from_dict(hit.get("power_uncertainty"))
+                if affine is None:
+                    affine = AffineQuantity(hit["power"])
+                total_affine = total_affine + affine
                 by_source[hit["source_label"]] = by_source.get(hit["source_label"], 0.0) + hit["power"]
                 wavelength_key = _wavelength_key(hit["wavelength_nm"])
                 by_wavelength[wavelength_key] = by_wavelength.get(wavelength_key, 0.0) + hit["power"]
@@ -222,6 +342,10 @@ class TraceBatch:
                 )
             summaries[detector] = {
                 "power": total_power,
+                "power_interval": (
+                    max(0.0, total_affine.interval()[0]),
+                    total_affine.interval()[1],
+                ),
                 "power_by_source": by_source,
                 "power_by_wavelength": by_wavelength,
                 "power_by_polarization": by_polarization,
@@ -432,6 +556,74 @@ class TraceBatch:
             for detector, summary in self.detector_summary().items()
         }
 
+    def uncertainty_summary(self, input_power: dict[str, float] | None = None) -> dict[str, dict[str, Any]]:
+        """Certain power, possible range and undeterminable share per source.
+
+        'certain' is detected power that does not depend on any measured
+        interval.  'possible' is the affine sum of detected powers that
+        do: beams sharing a measurement symbol recombine with their
+        correlation intact instead of adding as independent errors, and
+        the reported interval is clipped to the energy the source can
+        physically supply.  'unknown' is power that terminated on
+        unmeasured channels and cannot be determined at all.
+        """
+
+        inputs: dict[str, float] = {}
+        for index, ray in enumerate(self.rays):
+            label = ray.label if ray.label is not None else f"ray-{index}"
+            inputs[label] = inputs.get(label, 0.0) + ray.weight
+        collected: dict[str, dict[str, Any]] = {}
+        for result in self.results:
+            entry = collected.setdefault(result.source_label, {
+                "certain": 0.0,
+                "unknown": 0.0,
+                "possible_affine": AffineQuantity(0.0),
+                "unknown_affine": AffineQuantity(0.0),
+                "symbol_branches": {},
+            })
+            affine = AffineQuantity.from_dict(result.weight_uncertainty)
+            if affine is None:
+                affine = AffineQuantity(result.weight)
+            if result.status == "reached_image":
+                if affine.is_certain:
+                    entry["certain"] += result.weight
+                else:
+                    entry["possible_affine"] = entry["possible_affine"] + affine
+            elif result.status == "unknown_response":
+                entry["unknown"] += result.weight
+                entry["unknown_affine"] = entry["unknown_affine"] + affine
+            for symbol in affine.symbols:
+                entry["symbol_branches"].setdefault(symbol, set()).add(result.branch_id)
+        summary: dict[str, dict[str, Any]] = {}
+        for source, entry in collected.items():
+            source_input = (input_power or {}).get(source, inputs.get(source, 0.0))
+            possible = entry["possible_affine"]
+            low, high = possible.interval()
+            ceiling = max(0.0, source_input - entry["certain"])
+            clipped = high > ceiling + 1e-12 or low < -1e-12
+            unknown_affine = entry["unknown_affine"]
+            summary[source] = {
+                "input": source_input,
+                "certain": entry["certain"],
+                "possible": {
+                    "nominal": possible.constant,
+                    "interval": (max(0.0, low), min(high, ceiling)),
+                    "clipped_by_energy_constraint": clipped,
+                },
+                "unknown": entry["unknown"],
+                "unknown_interval": (
+                    unknown_affine.interval()
+                    if not unknown_affine.is_certain
+                    else (entry["unknown"], entry["unknown"])
+                ),
+                "shared_symbols": {
+                    symbol: sorted(branches)
+                    for symbol, branches in entry["symbol_branches"].items()
+                    if len(branches) > 1
+                },
+            }
+        return summary
+
     def compare_detector_power(self, other: "TraceBatch") -> dict[str, dict[str, Any]]:
         """Compare detector totals before and after a material-response change."""
 
@@ -545,6 +737,7 @@ class TraceBatch:
     def to_dict(self) -> dict[str, Any]:
         return {
             "project_name": self.project_name,
+            "measurement_batch_id": self.measurement_batch_id,
             "rays": [_ray_to_dict(ray) for ray in self.rays],
             "results": [
                 {
@@ -572,10 +765,11 @@ class TraceBatch:
                 depth=item.get("depth", len(item["events"])),
                 wavelength_nm=item.get("wavelength_nm", item["ray"].get("wavelength_nm")),
                 polarization=item.get("polarization"),
+                weight_uncertainty=item.get("weight_uncertainty"),
             )
             for item in data["results"]
         ]
-        return cls(data["project_name"], rays, results)
+        return cls(data["project_name"], rays, results, data.get("measurement_batch_id"))
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
