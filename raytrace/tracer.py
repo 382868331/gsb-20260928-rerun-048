@@ -423,6 +423,25 @@ class RayTracer:
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 transmitted = tuple(incident)
                 measured_split = self._measured_split(surface, current)
+                if (
+                    measured_split is None
+                    and self.measurements is None
+                    and not surface.has_engineering_response()
+                ):
+                    event.update({
+                        "action": "unknown_engineering_response",
+                        "unknown_channels": ["reflectivity", "transmissivity"],
+                        "reason": (
+                            f"beamsplitter {surface.identifier!r} has no active measurement "
+                            "batch or independent engineering response"
+                        ),
+                        "final_direction": incident,
+                        "absorbed_power": 0.0,
+                    })
+                    event["event_uid"] = event_counter
+                    event_counter += 1
+                    leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                    continue
                 if measured_split is not None:
                     # Measured interval responses: fractions are affine
                     # quantities over shared uncertainty symbols, so beams
@@ -452,23 +471,12 @@ class RayTracer:
                     if transmitted_affine is not None:
                         known_affine = known_affine + transmitted_affine
                     remainder_affine = weight_affine - known_affine
-                    remainder_interval = remainder_affine.interval()
-                    joint_note = None
                     if unknown_channels:
                         absorbed_affine = None
                         absorbed_power = 0.0
                     else:
                         absorbed_affine = remainder_affine
                         absorbed_power = remainder_affine.constant
-                        if remainder_interval[0] < 0.0:
-                            # The measured R/T intervals allow corners with
-                            # R + T > 1; absorption cannot be negative, so
-                            # the joint constraint clips that corner.
-                            joint_note = (
-                                "joint energy constraint R+T<=1 clips the "
-                                "absorbed interval at 0"
-                            )
-                            absorbed_power = max(0.0, absorbed_power)
                     reflected_weight = reflected_affine.constant if reflected_affine is not None else 0.0
                     transmitted_weight = transmitted_affine.constant if transmitted_affine is not None else 0.0
                     symbols: set[str] = set()
@@ -495,7 +503,7 @@ class RayTracer:
                         "reflected_power_interval": list(reflected_affine.interval()) if reflected_affine else None,
                         "transmitted_power_interval": list(transmitted_affine.interval()) if transmitted_affine else None,
                         "absorbed_power_interval": (
-                            [max(0.0, absorbed_affine.interval()[0]), absorbed_affine.interval()[1]]
+                            list(absorbed_affine.interval())
                             if absorbed_affine is not None else None
                         ),
                         "uncertainty_symbols": sorted(symbols),
@@ -504,8 +512,6 @@ class RayTracer:
                         "outgoing_direction": transmitted,
                         "outgoing_weight": transmitted_weight,
                     })
-                    if joint_note is not None:
-                        event["joint_energy_constraint"] = joint_note
                     event["event_uid"] = event_counter
                     event_counter += 1
                     base_events = self._extended_events(events, event, state["branch_id"], event_counter - 1)

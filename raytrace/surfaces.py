@@ -72,11 +72,14 @@ class Surface:
     back_material: str = "air"
     reflectivity: float = 1.0
     transmissivity: Optional[float] = None
+    beamsplitter_response_specified: Optional[bool] = None
     polarization_reflectivity: Optional[Mapping[str, float]] = None
     polarization_transmissivity: Optional[Mapping[str, float]] = None
     analyzer_angle_deg: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if self.beamsplitter_response_specified is None:
+            object.__setattr__(self, "beamsplitter_response_specified", False)
         if self.kind not in {"refract", "mirror", "detector", "beamsplitter", "aperture_stop"}:
             raise ValueError(f"unsupported surface kind {self.kind!r}")
         if self.shape not in {"plane", "sphere"}:
@@ -143,6 +146,15 @@ class Surface:
             return 1.0 - self.reflectivity
         return self.transmissivity
 
+    def has_engineering_response(self) -> bool:
+        """Whether this beamsplitter has a response independent of measurements."""
+
+        return bool(
+            self.beamsplitter_response_specified
+            or self.polarization_reflectivity is not None
+            or self.polarization_transmissivity is not None
+        )
+
     def intersect(self, origin: Vector, direction: Vector) -> Optional[tuple[float, Vector, Vector]]:
         if self.shape == "plane":
             return self._intersect_plane(origin, direction)
@@ -188,8 +200,28 @@ class Surface:
 
 
 def PlaneSurface(identifier: str, vertex: Vector, axis: Vector, **kwargs) -> Surface:
+    if (
+        kwargs.get("beamsplitter_response_specified") is None
+        and (
+            "reflectivity" in kwargs
+            or "transmissivity" in kwargs
+            or "polarization_reflectivity" in kwargs
+            or "polarization_transmissivity" in kwargs
+        )
+    ):
+        kwargs["beamsplitter_response_specified"] = True
     return Surface(identifier, shape="plane", vertex=vertex, axis=axis, **kwargs)
 
 
 def SphericalSurface(identifier: str, vertex: Vector, axis: Vector, radius: float, **kwargs) -> Surface:
+    if (
+        kwargs.get("beamsplitter_response_specified") is None
+        and (
+            "reflectivity" in kwargs
+            or "transmissivity" in kwargs
+            or "polarization_reflectivity" in kwargs
+            or "polarization_transmissivity" in kwargs
+        )
+    ):
+        kwargs["beamsplitter_response_specified"] = True
     return Surface(identifier, shape="sphere", vertex=vertex, axis=axis, radius=radius, **kwargs)

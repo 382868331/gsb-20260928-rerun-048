@@ -33,6 +33,7 @@ def _surface_from_dict(data: dict[str, Any]) -> Surface:
         "back_material": data.get("back_material", "air"),
         "reflectivity": data.get("reflectivity", 1.0),
         "transmissivity": data.get("transmissivity"),
+        "beamsplitter_response_specified": data.get("beamsplitter_response_specified"),
         "polarization_reflectivity": data.get("polarization_reflectivity"),
         "polarization_transmissivity": data.get("polarization_transmissivity"),
         "analyzer_angle_deg": data.get("analyzer_angle_deg"),
@@ -189,6 +190,10 @@ class Project:
                     f"Migrated to transmissivity={old_value:g}, reflectivity={1.0 - old_value:g} "
                     "so the original physical result is preserved."
                 )
+        for item in surface_data:
+            if item.get("kind") != "beamsplitter" or "beamsplitter_response_specified" in item:
+                continue
+            item["beamsplitter_response_specified"] = True
         project = cls(
             name=data["name"],
             description=data.get("description", ""),
@@ -343,8 +348,7 @@ class TraceBatch:
             summaries[detector] = {
                 "power": total_power,
                 "power_interval": (
-                    max(0.0, total_affine.interval()[0]),
-                    total_affine.interval()[1],
+                    *total_affine.interval(),
                 ),
                 "power_by_source": by_source,
                 "power_by_wavelength": by_wavelength,
@@ -599,16 +603,14 @@ class TraceBatch:
             source_input = (input_power or {}).get(source, inputs.get(source, 0.0))
             possible = entry["possible_affine"]
             low, high = possible.interval()
-            ceiling = max(0.0, source_input - entry["certain"])
-            clipped = high > ceiling + 1e-12 or low < -1e-12
             unknown_affine = entry["unknown_affine"]
             summary[source] = {
                 "input": source_input,
                 "certain": entry["certain"],
                 "possible": {
                     "nominal": possible.constant,
-                    "interval": (max(0.0, low), min(high, ceiling)),
-                    "clipped_by_energy_constraint": clipped,
+                    "interval": (low, high),
+                    "clipped_by_energy_constraint": False,
                 },
                 "unknown": entry["unknown"],
                 "unknown_interval": (

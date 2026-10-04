@@ -104,6 +104,10 @@ class AffineQuantity:
 _QUANTITIES = ("reflectivity", "transmissivity", "absorptivity")
 
 
+class InfeasibleMeasurementError(ValueError):
+    """Raised when measured response intervals cannot conserve energy."""
+
+
 @dataclass(frozen=True)
 class ResponseMeasurement:
     """One measured response interval for an element/channel."""
@@ -191,6 +195,98 @@ class MeasurementBatch:
             if measurement.key in seen:
                 raise ValueError(f"duplicate measurement for {measurement.key!r}")
             seen.add(measurement.key)
+        conflicts = self.energy_conflicts(self.measurements)
+        if conflicts:
+            conflict = conflicts[0]
+            channels = ", ".join(conflict["quantities"])
+            raise InfeasibleMeasurementError(
+                f"infeasible measurements for {conflict['surface']!r} "
+                f"({conflict['wavelength_description']}, "
+                f"{conflict['polarization_description']}): conflicting channels "
+                f"{channels} have lower bounds summing to {conflict['lower_sum']:g} > 1"
+            )
+
+    @staticmethod
+    def energy_conflicts(measurements: tuple[ResponseMeasurement, ...]) -> list[dict[str, Any]]:
+        """Return response channels whose measured intervals make R+T+A impossible."""
+
+        conflicts: list[dict[str, Any]] = []
+        surfaces = sorted({measurement.surface for measurement in measurements})
+        wavelengths = [None] + sorted({
+            measurement.wavelength_nm
+            for measurement in measurements
+            if measurement.wavelength_nm is not None
+        })
+        polarizations = [None, "s", "p"]
+        reported: set[frozenset[tuple]] = set()
+
+        for surface in surfaces:
+            surface_measurements = [
+                measurement for measurement in measurements if measurement.surface == surface
+            ]
+            for wavelength_nm in wavelengths:
+                for polarization in polarizations:
+                    quantities: dict[str, ResponseMeasurement] = {}
+                    for measurement in surface_measurements:
+                        if measurement.wavelength_nm is not None and (
+                            wavelength_nm is None
+                            or float(measurement.wavelength_nm) != float(wavelength_nm)
+                        ):
+                            continue
+                        if measurement.polarization is not None and (
+                            polarization is None or measurement.polarization != polarization
+                        ):
+                            continue
+                        previous = quantities.get(measurement.quantity)
+                        if previous is None:
+                            quantities[measurement.quantity] = measurement
+                            continue
+                        specificity = (
+                            (measurement.wavelength_nm is not None)
+                            + (measurement.polarization is not None)
+                        )
+                        previous_specificity = (
+                            (previous.wavelength_nm is not None)
+                            + (previous.polarization is not None)
+                        )
+                        if specificity > previous_specificity:
+                            quantities[measurement.quantity] = measurement
+
+                    if len(quantities) < 2:
+                        continue
+                    selected_keys = frozenset(measurement.key for measurement in quantities.values())
+                    if selected_keys in reported:
+                        continue
+                    reported.add(selected_keys)
+                    lower_sum = sum(quantity.lower for quantity in quantities.values())
+                    upper_sum = sum(quantity.upper for quantity in quantities.values())
+                    measured_all_three = set(quantities) == set(_QUANTITIES)
+                    infeasible = lower_sum > 1.0 + 1e-12 or (
+                        measured_all_three and upper_sum < 1.0 - 1e-12
+                    )
+                    if not infeasible:
+                        continue
+                    conflicts.append({
+                        "surface": surface,
+                        "wavelength_nm": wavelength_nm,
+                        "polarization": polarization,
+                        "wavelength_description": (
+                            "broadband" if wavelength_nm is None else f"{wavelength_nm:g} nm"
+                        ),
+                        "polarization_description": polarization or "scalar",
+                        "quantities": [
+                            quantity
+                            for quantity in _QUANTITIES
+                            if quantity in quantities
+                        ],
+                        "intervals": {
+                            name: [measurement.lower, measurement.upper]
+                            for name, measurement in quantities.items()
+                        },
+                        "lower_sum": lower_sum,
+                        "upper_sum": upper_sum,
+                    })
+        return conflicts
 
     def surfaces_declared(self) -> set[str]:
         return {measurement.surface for measurement in self.measurements}
@@ -265,4 +361,3 @@ class MeasurementBatch:
                 ResponseMeasurement.from_dict(item) for item in data.get("measurements", [])
             ),
         )
-

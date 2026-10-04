@@ -1,7 +1,7 @@
 """Minimal geometric ray-tracing core for educational optical models."""
 
 from .materials import Material, MaterialLibrary, UnknownMaterialResponse
-from .measurements import AffineQuantity, MeasurementBatch, ResponseMeasurement
+from .measurements import AffineQuantity, InfeasibleMeasurementError, MeasurementBatch, ResponseMeasurement
 from .project import Project, TraceBatch, load_batch, load_project
 from .surfaces import (
     CircularAperture,
@@ -14,6 +14,7 @@ from .tracer import Ray, RayResult, RayTracer, TraceSettings
 __all__ = [
     "AffineQuantity",
     "CircularAperture",
+    "InfeasibleMeasurementError",
     "Material",
     "MaterialLibrary",
     "MeasurementBatch",

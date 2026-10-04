@@ -1071,36 +1071,24 @@ class MeasuredResponseTests(unittest.TestCase):
         ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
         self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
 
-    def test_joint_energy_constraint_clips_impossible_total(self):
+    def test_infeasible_energy_combination_is_rejected_before_tracing(self):
         from raytrace import MeasurementBatch, ResponseMeasurement
         project = self._splitter_project()
-        # Independently measured R and T whose upper bounds exceed 1.
-        project.add_measurement_batch(MeasurementBatch(
-            "crew-wide",
-            measurements=(
-                ResponseMeasurement("splitter", "reflectivity", 0.4, 0.6),
-                ResponseMeasurement("splitter", "transmissivity", 0.4, 0.6),
-            ),
-        ))
-        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        with self.assertRaisesRegex(ValueError, "reflectivity, transmissivity") as context:
+            MeasurementBatch(
+                "crew-impossible",
+                measurements=(
+                    ResponseMeasurement("splitter", "reflectivity", 0.73, 0.81),
+                    ResponseMeasurement("splitter", "transmissivity", 0.49, 0.57),
+                ),
+            )
 
-        split_event = next(
-            event for leaf in batch.results for event in leaf.events
-            if event["action"] == "split"
-        )
-        self.assertIn("joint_energy_constraint", split_event)
-        self.assertEqual(
-            [round(v, 12) for v in split_event["absorbed_power_interval"]],
-            [0.0, 0.2],
-        )
-        uncertainty = batch.uncertainty_summary()["src"]
-        # Raw R+T reaches 1.2; the joint constraint clips the total to the
-        # physical input instead of reporting impossible energy.
-        self.assertEqual(
-            tuple(round(v, 12) for v in uncertainty["possible"]["interval"]),
-            (0.8, 1.0),
-        )
-        self.assertTrue(uncertainty["possible"]["clipped_by_energy_constraint"])
+        message = str(context.exception)
+        self.assertIn("splitter", message)
+        self.assertIn("broadband", message)
+        self.assertIn("scalar", message)
+        self.assertIn("1.22", message)
+        self.assertNotIn("crew-impossible", project.measurement_batches)
 
     def test_conflicting_batches_revoke_and_provenance_survive_reopen(self):
         from raytrace import MeasurementBatch, ResponseMeasurement, load_batch
@@ -1156,6 +1144,43 @@ class MeasuredResponseTests(unittest.TestCase):
             self.assertEqual(
                 audited.uncertainty_summary(), batch_a.uncertainty_summary(),
             )
+
+    def test_revoking_only_measurement_keeps_new_trace_unknown_after_reopen(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement, load_batch
+        project = self._splitter_project()
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-only",
+            measurements=(
+                ResponseMeasurement("splitter", "reflectivity", 0.3, 0.5),
+                ResponseMeasurement("splitter", "absorptivity", 0.0, 0.0),
+            ),
+        ))
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        old_batch = project.trace_rays(rays)
+
+        with tempfile.TemporaryDirectory() as directory:
+            project_path = Path(directory) / "project.json"
+            batch_path = Path(directory) / "old-trace.json"
+            old_batch.save(batch_path)
+            project.revoke_measurement_batch("crew-only")
+            project.save(project_path)
+
+            reopened_project = Project.load(project_path)
+            reopened_old_batch = load_batch(batch_path)
+            new_batch = reopened_project.trace_rays(rays)
+            audited = reopened_project.trace_with_measurements("crew-only", rays)
+
+        self.assertEqual(reopened_old_batch.detector_summary(), old_batch.detector_summary())
+        self.assertEqual(audited.detector_summary(), old_batch.detector_summary())
+        self.assertIsNone(new_batch.measurement_batch_id)
+        self.assertEqual(new_batch.status_summary(), {"unknown_response": 1})
+        self.assertEqual(new_batch.detector_hits(), {})
+        event = new_batch.results[0].events[-1]
+        self.assertEqual(event["action"], "unknown_engineering_response")
+        self.assertEqual(event["unknown_channels"], ["reflectivity", "transmissivity"])
+        ledger = new_batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unknown_response"], 1.0)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
 
     def test_measured_project_roundtrip_reproduces_uncertainty(self):
         from raytrace import MeasurementBatch, ResponseMeasurement
