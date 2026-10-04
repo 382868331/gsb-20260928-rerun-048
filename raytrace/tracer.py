@@ -178,11 +178,19 @@ class RayResult:
 
 class RayTracer:
     def __init__(self, surfaces: list[Surface], materials: MaterialLibrary, settings: TraceSettings | None = None,
-                 measurements: MeasurementBatch | None = None):
+                 measurements: MeasurementBatch | None = None,
+                 measurement_governed_surfaces: set[str] | None = None):
         self.surfaces = surfaces
         self.materials = materials
         self.settings = settings or TraceSettings()
         self.measurements = measurements
+        # Surfaces whose physical response is known only from measurement
+        # batches.  When the active/audited batch does not cover such a
+        # surface (e.g. its sole basis was revoked), branches terminate as
+        # unknown instead of falling back to the design-default
+        # reflectivity.  ``None`` means no measured basis ever existed in
+        # the project, so the original design constants still apply.
+        self.measurement_governed_surfaces = measurement_governed_surfaces
         self._noise_counter = 0
 
     def _noise(self) -> str:
@@ -422,6 +430,13 @@ class RayTracer:
             if surface.kind == "beamsplitter":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 transmitted = tuple(incident)
+                missing_basis = self._missing_measurement_basis(surface, current)
+                if missing_basis is not None:
+                    event.update(missing_basis)
+                    event["event_uid"] = event_counter
+                    event_counter += 1
+                    leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                    continue
                 measured_split = self._measured_split(surface, current)
                 if measured_split is not None:
                     # Measured interval responses: fractions are affine
@@ -653,6 +668,13 @@ class RayTracer:
 
             if surface.kind == "mirror":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
+                missing_basis = self._missing_measurement_basis(surface, current)
+                if missing_basis is not None:
+                    event.update(missing_basis)
+                    event["event_uid"] = event_counter
+                    event_counter += 1
+                    leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                    continue
                 measured_reflectivity = None
                 if self.measurements is not None and surface.identifier in self.measurements.surfaces_declared():
                     measured_reflectivity = self.measurements.interval(
@@ -662,9 +684,12 @@ class RayTracer:
                         event.update({
                             "action": "unknown_measured_response",
                             "measurement_batch": self.measurements.batch_id,
+                            "unknown_channels": ["reflectivity"],
+                            "surface_response_basis_revoked": False,
                             "reason": (
                                 f"measurement batch {self.measurements.batch_id!r} declares"
                                 f" {surface.identifier!r} without a reflectivity interval"
+                                " for this channel"
                             ),
                             "final_direction": incident,
                             "absorbed_power": 0.0,
@@ -983,6 +1008,50 @@ class RayTracer:
             ray.polarization,
         )
         return reflected_fraction, transmitted_fraction, reflected_field, transmitted_field, s_fraction
+
+    def _missing_measurement_basis(self, surface: Surface, ray: Ray):
+        """Unknown-response event payload when no verified basis applies.
+
+        A surface whose only physical basis came from measurement batches
+        must not fall back to the design-default reflectivity when the
+        active/audited batch has no declaration for it at all (the typical
+        case is tracing with no active batch after the sole basis was
+        revoked, or auditing a batch that never measured this surface).
+        Partial channels within a batch that does declare the surface are
+        handled by the existing unknown_channels machinery.
+        """
+
+        governed = self.measurement_governed_surfaces
+        if governed is None or surface.identifier not in governed:
+            return None
+        batch = self.measurements
+        required = ("reflectivity",) if surface.kind == "mirror" else (
+            "reflectivity", "transmissivity",
+        )
+        if batch is not None and surface.identifier in batch.surfaces_declared():
+            return None
+        basis = batch.batch_id if batch is not None else None
+        if batch is None:
+            reason = (
+                f"no active measurement batch verifies {surface.identifier!r}; "
+                "its sole measurement basis was revoked and the design "
+                "default must not be substituted"
+            )
+        else:
+            reason = (
+                f"measurement batch {batch.batch_id!r} does not declare "
+                f"{surface.identifier!r}; the design default must not be substituted"
+            )
+        missing_channels = list(required)
+        return {
+            "action": "unknown_measured_response",
+            "measurement_batch": basis,
+            "surface_response_basis_revoked": batch is None,
+            "unknown_channels": missing_channels,
+            "reason": reason,
+            "final_direction": tuple(ray.direction),
+            "absorbed_power": 0.0,
+        }
 
     def _measured_split(self, surface: Surface, ray: Ray):
         """Per-axis measured interval split, or None when nothing is declared.

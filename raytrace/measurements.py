@@ -247,6 +247,80 @@ class MeasurementBatch:
                 })
         return conflicts
 
+    def energy_violations(self) -> list[dict[str, Any]]:
+        """Channels whose measured intervals admit no physical R+T+A split.
+
+        Measurements are grouped by physical channel (surface, wavelength,
+        polarization).  When two or three of reflectivity/transmissivity/
+        absorptivity are measured for the same channel, energy conservation
+        requires a joint assignment with R + T + A == 1, which exists only
+        when the lower bounds sum to at most 1 (and, with all three
+        measured, the upper bounds sum to at least 1).  Independently wide
+        intervals whose lower bounds already exceed 1 -- e.g.
+        R in [0.73, 0.81] with T in [0.49, 0.57] -- are not a clip-able
+        corner: the group is physically impossible and must be rejected
+        instead of feeding probe energy from an impossible split.
+        """
+
+        groups: dict[tuple, dict[str, ResponseMeasurement]] = {}
+        for measurement in self.measurements:
+            channel = (measurement.surface, measurement.wavelength_nm, measurement.polarization)
+            groups.setdefault(channel, {})[measurement.quantity] = measurement
+
+        violations: list[dict[str, Any]] = []
+        for (surface, wavelength_nm, polarization), quantities in sorted(
+            groups.items(), key=lambda item: item[0]
+        ):
+            if len(quantities) < 2:
+                continue
+            lower_sum = sum(quantity.lower for quantity in quantities.values())
+            upper_sum = sum(quantity.upper for quantity in quantities.values())
+            impossible = lower_sum > 1.0 + 1e-12
+            if len(quantities) == 3:
+                impossible = impossible or upper_sum < 1.0 - 1e-12
+            if not impossible:
+                continue
+            violations.append({
+                "surface": surface,
+                "wavelength_nm": wavelength_nm,
+                "polarization": polarization,
+                "quantities": {
+                    name: [quantity.lower, quantity.upper]
+                    for name, quantity in sorted(quantities.items())
+                },
+                "lower_sum": lower_sum,
+                "upper_sum": upper_sum,
+            })
+        return violations
+
+    def assert_energy_feasible(self) -> None:
+        """Raise ``ValueError`` naming every conflicting channel."""
+
+        violations = self.energy_violations()
+        if not violations:
+            return
+        descriptions = []
+        for violation in violations:
+            wavelength = (
+                "broadband" if violation["wavelength_nm"] is None
+                else f"{violation['wavelength_nm']:g} nm"
+            )
+            polarization = violation["polarization"] or "scalar"
+            channels = ", ".join(
+                f"{name}={interval!r}"
+                for name, interval in violation["quantities"].items()
+            )
+            descriptions.append(
+                f"surface {violation['surface']!r} ({wavelength}, {polarization}): "
+                f"{channels}; lower bounds sum to {violation['lower_sum']:g} > 1, "
+                "so no R+T+A<=1 assignment exists"
+            )
+        raise ValueError(
+            f"measurement batch {self.batch_id!r} contains infeasible response "
+            "combinations that violate energy conservation (conflicting "
+            f"channels: {'; '.join(descriptions)})"
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "batch_id": self.batch_id,
@@ -265,4 +339,3 @@ class MeasurementBatch:
                 ResponseMeasurement.from_dict(item) for item in data.get("measurements", [])
             ),
         )
-

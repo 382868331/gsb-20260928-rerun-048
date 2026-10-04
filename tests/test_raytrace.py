@@ -1185,6 +1185,162 @@ class MeasuredResponseTests(unittest.TestCase):
         self.assertEqual(recalculated.uncertainty_summary(), batch.uncertainty_summary())
         self.assertEqual(recalculated.energy_ledger(), batch.energy_ledger())
 
+    def test_infeasible_lower_bounds_are_rejected_not_clipped(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        project = self._splitter_project()
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        bad_batch = MeasurementBatch(
+            "crew-bad",
+            measurements=(
+                ResponseMeasurement("splitter", "reflectivity", 0.73, 0.81),
+                ResponseMeasurement("splitter", "transmissivity", 0.49, 0.57),
+            ),
+        )
+
+        violations = bad_batch.energy_violations()
+        self.assertEqual(len(violations), 1)
+        violation = violations[0]
+        self.assertEqual(violation["surface"], "splitter")
+        self.assertEqual(violation["quantities"]["reflectivity"], [0.73, 0.81])
+        self.assertEqual(violation["quantities"]["transmissivity"], [0.49, 0.57])
+        self.assertAlmostEqual(violation["lower_sum"], 1.22, places=12)
+
+        # Registering the batch refuses the measurement group outright.
+        with self.assertRaises(ValueError) as context:
+            project.add_measurement_batch(bad_batch)
+        message = str(context.exception)
+        self.assertIn("splitter", message)
+        self.assertIn("reflectivity", message)
+        self.assertIn("transmissivity", message)
+        self.assertIn("1.22", message)
+        self.assertNotIn("crew-bad", project.measurement_batches)
+
+        # Forcing the batch into the archive still refuses to generate
+        # probe energy: nothing is clipped and summarized afterwards.
+        project.measurement_batches["crew-bad"] = bad_batch
+        project.active_measurement_batch = "crew-bad"
+        with self.assertRaises(ValueError):
+            project.trace_rays(rays)
+        with self.assertRaises(ValueError):
+            project.trace_with_measurements("crew-bad", rays)
+        with self.assertRaises(ValueError):
+            project.compare_measurement_batches("crew-bad", "crew-bad", rays)
+
+    def test_feasible_wide_intervals_still_clip_inside_recombination(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        project = self._splitter_project()
+        # Lower bounds sum to 0.8 (feasible corners exist); only the
+        # R+T>1 corner is clipped, the group is not rejected.
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-wide",
+            measurements=(
+                ResponseMeasurement("splitter", "reflectivity", 0.4, 0.6),
+                ResponseMeasurement("splitter", "transmissivity", 0.4, 0.6),
+            ),
+        ))
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        uncertainty = batch.uncertainty_summary()["src"]
+        self.assertTrue(uncertainty["possible"]["clipped_by_energy_constraint"])
+
+    def test_revoked_sole_basis_keeps_new_trace_unknown_no_default(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement, load_batch
+        project = self._splitter_project()
+        # The splitter's design default (reflectivity=1.0) would dump the
+        # full power into the reflected detector if it were used after the
+        # only measurement basis is revoked.
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-only",
+            measurements=(
+                ResponseMeasurement("splitter", "reflectivity", 0.3, 0.5),
+                ResponseMeasurement("splitter", "absorptivity", 0.0, 0.0),
+            ),
+        ))
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        old_batch = project.trace_rays(rays)
+        old_summary = old_batch.detector_summary()
+        old_uncertainty = old_batch.uncertainty_summary()
+
+        with tempfile.TemporaryDirectory() as directory:
+            project_path = Path(directory) / "project.json"
+            old_path = Path(directory) / "old-trace.json"
+            project.save(project_path)
+            old_batch.save(old_path)
+            project.revoke_measurement_batch("crew-only")
+            project.save(project_path)
+
+            reopened_project = Project.load(project_path)
+            reopened_old = load_batch(old_path)
+
+            # Old project/trace still audit against the original batch.
+            self.assertEqual(reopened_old.measurement_batch_id, "crew-only")
+            audited = reopened_project.trace_with_measurements("crew-only", rays)
+            self.assertEqual(audited.detector_summary(), old_summary)
+            self.assertEqual(audited.uncertainty_summary(), old_uncertainty)
+
+            # New traces have no basis and must remain unknown rather than
+            # substituting the default reflectivity.
+            new_batch = reopened_project.trace_rays(rays)
+            self.assertIsNone(new_batch.measurement_batch_id)
+            self.assertEqual(new_batch.detector_summary(), {})
+            statuses = new_batch.status_summary()
+            self.assertEqual(statuses.get("unknown_response"), 1)
+            ledger = new_batch.energy_ledger(input_power={"src": 1.0})["src"]
+            self.assertAlmostEqual(ledger["unknown_response"], 1.0, places=12)
+            self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+            unknown_event = next(
+                event for leaf in new_batch.results for event in leaf.events
+                if event.get("action") == "unknown_measured_response"
+            )
+            self.assertTrue(unknown_event["surface_response_basis_revoked"])
+            self.assertIn("revoked", unknown_event["reason"])
+            self.assertEqual(
+                unknown_event["unknown_channels"], ["reflectivity", "transmissivity"]
+            )
+
+    def test_recombined_path_conservation_before_and_after_reopen(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement, load_batch
+        a = math.sqrt(0.5)
+        surfaces = [
+            PlaneSurface("splitter1", (0.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(0.5)),
+            PlaneSurface("mirror_top", (3.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(0.5)),
+            PlaneSurface("mirror_side", (0.0, -2.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(0.5)),
+            PlaneSurface("splitter2", (3.0, -2.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(0.5),
+                         reflectivity=0.5),
+            PlaneSurface("detector", (5.0, -2.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        project = Project("mach-zehnder-save", surfaces, MaterialLibrary())
+        project.add_measurement_batch(MeasurementBatch(
+            "crew-mz",
+            measurements=(
+                ResponseMeasurement("splitter1", "reflectivity", 0.3, 0.5),
+                ResponseMeasurement("splitter1", "absorptivity", 0.0, 0.0),
+            ),
+        ))
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        batch = project.trace_rays(rays)
+        with tempfile.TemporaryDirectory() as directory:
+            project_path = Path(directory) / "project.json"
+            batch_path = Path(directory) / "batch.json"
+            project.save(project_path)
+            batch.save(batch_path)
+            reopened_project = Project.load(project_path)
+            reopened_batch = load_batch(batch_path)
+            recalculated = reopened_project.trace_rays(rays)
+
+        for checked in (batch, reopened_batch, recalculated):
+            summary = checked.detector_summary()["detector"]
+            low, high = summary["power_interval"]
+            self.assertAlmostEqual(summary["power"], 0.5, places=12)
+            self.assertAlmostEqual(low, 0.5, places=12)
+            self.assertAlmostEqual(high, 0.5, places=12)
+            ledger = checked.energy_ledger(input_power={"src": 1.0})["src"]
+            self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+
 
 if __name__ == "__main__":
     unittest.main()

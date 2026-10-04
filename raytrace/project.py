@@ -66,6 +66,10 @@ class Project:
     LEGACY_CONVENTION = "legacy-beamsplitter-reflectivity-is-transmission"
 
     def add_measurement_batch(self, batch: MeasurementBatch, activate: bool = True) -> None:
+        # An infeasible batch (e.g. R lower bound + T lower bound > 1) must
+        # be rejected outright: it names conflicting channels and no trace
+        # may consume probe energy from such a split.
+        batch.assert_energy_feasible()
         self.measurement_batches[batch.batch_id] = batch
         if activate:
             if batch.revoked:
@@ -101,6 +105,23 @@ class Project:
             return None
         return batch
 
+    def measurement_governed_surfaces(self) -> set[str] | None:
+        """Surfaces whose response is only known through measurement batches.
+
+        When a project has never held any measurement for a surface, its
+        design-default reflectivity/transmissivity remain physical inputs.
+        Once at least one batch measures the surface, later traces --
+        including those after the sole basis is revoked -- must leave the
+        response unknown rather than silently switching back to the default.
+        """
+
+        if not self.measurement_batches:
+            return None
+        governed: set[str] = set()
+        for batch in self.measurement_batches.values():
+            governed.update(batch.surfaces_declared())
+        return governed
+
     def trace_with_measurements(self, batch_id: str, rays: list[Ray]) -> "TraceBatch":
         """Trace with one specific batch, even a revoked one (for audits)."""
 
@@ -108,7 +129,14 @@ class Project:
             batch = self.measurement_batches[batch_id]
         except KeyError:
             raise KeyError(f"unknown measurement batch {batch_id!r}") from None
-        tracer = RayTracer(self.surfaces, self.materials, self.settings, measurements=batch)
+        # A physically impossible batch is never traced, even on audit:
+        # no probe energy can come from an impossible R+T(+A) split.
+        batch.assert_energy_feasible()
+        tracer = RayTracer(
+            self.surfaces, self.materials, self.settings,
+            measurements=batch,
+            measurement_governed_surfaces=self.measurement_governed_surfaces(),
+        )
         return TraceBatch(
             project_name=self.name,
             rays=rays,
@@ -220,7 +248,13 @@ class Project:
 
     def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
         measurements = self.active_measurements()
-        tracer = RayTracer(self.surfaces, self.materials, self.settings, measurements=measurements)
+        if measurements is not None:
+            measurements.assert_energy_feasible()
+        tracer = RayTracer(
+            self.surfaces, self.materials, self.settings,
+            measurements=measurements,
+            measurement_governed_surfaces=self.measurement_governed_surfaces(),
+        )
         return TraceBatch(
             project_name=self.name,
             rays=rays,
