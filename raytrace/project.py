@@ -102,6 +102,19 @@ class Project:
             return None
         return batch
 
+    def measurement_dependent_surfaces(self) -> set[str]:
+        """Surfaces whose response any recorded batch declares, even revoked.
+
+        Once a surface's response has been attributed to measured data,
+        revoking or deactivating that basis must leave the response unknown
+        rather than silently falling back to scalar defaults.
+        """
+
+        dependent: set[str] = set()
+        for batch in self.measurement_batches.values():
+            dependent.update(batch.surfaces_declared())
+        return dependent
+
     def trace_with_measurements(self, batch_id: str, rays: list[Ray]) -> "TraceBatch":
         """Trace with one specific batch, even a revoked one (for audits)."""
 
@@ -109,7 +122,13 @@ class Project:
             batch = self.measurement_batches[batch_id]
         except KeyError:
             raise KeyError(f"unknown measurement batch {batch_id!r}") from None
-        tracer = RayTracer(self.surfaces, self.materials, self.settings, measurements=batch)
+        tracer = RayTracer(
+            self.surfaces,
+            self.materials,
+            self.settings,
+            measurements=batch,
+            measurement_dependent_surfaces=self.measurement_dependent_surfaces(),
+        )
         return TraceBatch(
             project_name=self.name,
             rays=rays,
@@ -225,7 +244,13 @@ class Project:
 
     def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
         measurements = self.active_measurements()
-        tracer = RayTracer(self.surfaces, self.materials, self.settings, measurements=measurements)
+        tracer = RayTracer(
+            self.surfaces,
+            self.materials,
+            self.settings,
+            measurements=measurements,
+            measurement_dependent_surfaces=self.measurement_dependent_surfaces(),
+        )
         return TraceBatch(
             project_name=self.name,
             rays=rays,

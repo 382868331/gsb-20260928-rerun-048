@@ -954,6 +954,27 @@ class MeasuredResponseTests(unittest.TestCase):
         ]
         return Project("measured-splitter", surfaces, MaterialLibrary())
 
+    @staticmethod
+    def _measured_mirror_mz_project():
+        """Mach-Zehnder whose only measured elements are the two mirrors."""
+
+        a = math.sqrt(0.5)
+        surfaces = [
+            PlaneSurface("splitter1", (0.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(0.5),
+                         reflectivity=0.5),
+            PlaneSurface("mirror_top", (3.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(0.5)),
+            PlaneSurface("mirror_side", (0.0, -2.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(0.5)),
+            PlaneSurface("splitter2", (3.0, -2.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(0.5),
+                         reflectivity=0.5),
+            PlaneSurface("detector", (5.0, -2.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        return Project("mach-zehnder-mirrors", surfaces, MaterialLibrary())
+
     def test_partial_measurement_stays_unknown_not_lossless(self):
         from raytrace import MeasurementBatch, ResponseMeasurement
         project = self._splitter_project()
@@ -1181,6 +1202,168 @@ class MeasuredResponseTests(unittest.TestCase):
         ledger = new_batch.energy_ledger(input_power={"src": 1.0})["src"]
         self.assertAlmostEqual(ledger["unknown_response"], 1.0)
         self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+
+    def test_mirror_channel_gap_is_not_filled_by_other_channels_or_defaults(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        a = math.sqrt(0.5)
+        surfaces = [
+            PlaneSurface("mirror", (0.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(1.0)),
+            PlaneSurface("detector", (0.0, -2.0, 0.0), (0.0, 1.0, 0.0),
+                         kind="detector", aperture=CircularAperture(2.0)),
+        ]
+        project = Project("pol-gap", surfaces, MaterialLibrary())
+        # Only the s-polarization channel has a measured interval; the
+        # unpolarized query must not be answered with it or with the
+        # default reflectivity.
+        project.add_measurement_batch(MeasurementBatch(
+            "s-only",
+            measurements=(
+                ResponseMeasurement("mirror", "reflectivity", 0.8, 0.9, polarization="s"),
+            ),
+        ))
+        batch = project.trace_rays([Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")])
+        self.assertEqual(batch.status_summary(), {"unknown_response": 1})
+        self.assertEqual(batch.detector_hits(), {})
+        event = batch.results[0].events[-1]
+        self.assertEqual(event["action"], "unknown_measured_response")
+        self.assertEqual(event["surface"], "mirror")
+        self.assertEqual(event["unknown_channels"], ["reflectivity"])
+
+    def test_measured_mirror_mz_revoke_partial_and_remeasure(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement, load_batch
+        project = self._measured_mirror_mz_project()
+        project.add_measurement_batch(MeasurementBatch(
+            "mirrors-450",
+            measurements=(
+                ResponseMeasurement("mirror_top", "reflectivity", 0.9, 1.0, wavelength_nm=450.0),
+                ResponseMeasurement("mirror_side", "reflectivity", 0.9, 1.0, wavelength_nm=450.0),
+            ),
+        ))
+        project.add_measurement_batch(MeasurementBatch(
+            "mirrors-650",
+            measurements=(
+                ResponseMeasurement("mirror_top", "reflectivity", 0.85, 0.95, wavelength_nm=650.0),
+                ResponseMeasurement("mirror_side", "reflectivity", 0.85, 0.95, wavelength_nm=650.0),
+            ),
+        ), activate=False)
+        rays = [Ray.spectral((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), [450.0, 650.0], label="src")]
+
+        # Valid measurement: the recombined 450 nm path reaches the detector
+        # twice; 650 nm has no interval in the active batch and stays
+        # unknown instead of borrowing the 450 nm response.
+        measured = project.trace_rays(rays)
+        hits = measured.detector_hits()["detector"]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual({hit["wavelength_nm"] for hit in hits}, {450.0})
+        low, high = measured.detector_summary()["detector"]["power_interval"]
+        self.assertAlmostEqual(low, 0.225, places=12)
+        self.assertAlmostEqual(high, 0.25, places=12)
+        unknown = [leaf for leaf in measured.results if leaf.status == "unknown_response"]
+        self.assertEqual({leaf.wavelength_nm for leaf in unknown}, {650.0})
+        self.assertEqual(unknown[0].events[-1]["action"], "unknown_measured_response")
+
+        with tempfile.TemporaryDirectory() as directory:
+            pre_project_path = Path(directory) / "pre-revoke-project.json"
+            pre_batch_path = Path(directory) / "pre-revoke-trace.json"
+            project.save(pre_project_path)
+            measured.save(pre_batch_path)
+
+            # Partial revoke: the inactive 650 nm basis is withdrawn.  The
+            # 450 nm channel keeps its valid measurement and is unchanged;
+            # 650 nm stays unknown (no borrowing, no defaults).
+            project.revoke_measurement_batch("mirrors-650")
+            partial = project.trace_rays(rays)
+            self.assertEqual(partial.detector_hits(), measured.detector_hits())
+            partial_unknown = [
+                leaf for leaf in partial.results if leaf.status == "unknown_response"
+            ]
+            self.assertEqual({leaf.wavelength_nm for leaf in partial_unknown}, {650.0})
+
+            # Full revoke: every measured element loses its only basis.
+            # The trace must not fall back to the default mirror
+            # reflectivity; it ends unknown and names elements/channels.
+            project.revoke_measurement_batch("mirrors-450")
+            self.assertIsNone(project.active_measurement_batch)
+            revoked = project.trace_rays(rays)
+            self.assertEqual(revoked.detector_hits(), {})
+            self.assertEqual(revoked.status_summary(), {"unknown_response": 4})
+            self.assertIsNone(revoked.measurement_batch_id)
+            named = {
+                (leaf.events[-1]["surface"], tuple(leaf.events[-1]["unknown_channels"]))
+                for leaf in revoked.results
+            }
+            self.assertEqual(named, {
+                ("mirror_top", ("reflectivity",)),
+                ("mirror_side", ("reflectivity",)),
+            })
+            for leaf in revoked.results:
+                self.assertEqual(leaf.events[-1]["action"], "unknown_measured_response")
+            ledger = revoked.energy_ledger(input_power={"src": 1.0})["src"]
+            self.assertAlmostEqual(ledger["unknown_response"], 1.0)
+            self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+
+            # The project and trace saved before the revoke still
+            # reproduce the original measured results.
+            reopened_pre = Project.load(pre_project_path)
+            self.assertEqual(reopened_pre.active_measurement_batch, "mirrors-450")
+            self.assertEqual(
+                reopened_pre.trace_rays(rays).detector_summary(),
+                measured.detector_summary(),
+            )
+            self.assertEqual(
+                load_batch(pre_batch_path).detector_summary(),
+                measured.detector_summary(),
+            )
+
+            # Re-measure: a new valid batch re-enables tracing without
+            # rewriting the revoked history.
+            project.add_measurement_batch(MeasurementBatch(
+                "mirrors-final",
+                measurements=(
+                    ResponseMeasurement("mirror_top", "reflectivity", 0.9, 1.0, wavelength_nm=450.0),
+                    ResponseMeasurement("mirror_side", "reflectivity", 0.9, 1.0, wavelength_nm=450.0),
+                    ResponseMeasurement("mirror_top", "reflectivity", 0.85, 0.95, wavelength_nm=650.0),
+                    ResponseMeasurement("mirror_side", "reflectivity", 0.85, 0.95, wavelength_nm=650.0),
+                ),
+            ))
+            remeasured = project.trace_rays(rays)
+            self.assertEqual(remeasured.measurement_batch_id, "mirrors-final")
+            remeasured_hits = remeasured.detector_hits()["detector"]
+            self.assertEqual(len(remeasured_hits), 4)
+            self.assertEqual(
+                {hit["wavelength_nm"] for hit in remeasured_hits}, {450.0, 650.0}
+            )
+            self.assertAlmostEqual(
+                remeasured.detector_summary()["detector"]["power_by_wavelength"]["450 nm"],
+                measured.detector_summary()["detector"]["power"],
+                places=12,
+            )
+
+            # Save/reopen: every recorded result still points at the
+            # measurement basis (materials) it was produced with.
+            post_project_path = Path(directory) / "post-project.json"
+            remeasured_path = Path(directory) / "remeasured-trace.json"
+            project.save(post_project_path)
+            remeasured.save(remeasured_path)
+            reopened = Project.load(post_project_path)
+            self.assertTrue(reopened.measurement_batches["mirrors-450"].revoked)
+            self.assertTrue(reopened.measurement_batches["mirrors-650"].revoked)
+            self.assertEqual(reopened.active_measurement_batch, "mirrors-final")
+            self.assertEqual(load_batch(remeasured_path).measurement_batch_id, "mirrors-final")
+            self.assertEqual(load_batch(pre_batch_path).measurement_batch_id, "mirrors-450")
+            recalculated = reopened.trace_rays(rays)
+            self.assertEqual(recalculated.detector_summary(), remeasured.detector_summary())
+            # Auditing the revoked 450 nm batch still reproduces the
+            # original measured numbers.
+            audited = reopened.trace_with_measurements("mirrors-450", rays)
+            self.assertEqual(audited.detector_summary(), measured.detector_summary())
+            # Revocation survives the reopen: no active-basis trace on the
+            # pre-revoke file falls back to defaults either.
+            reopened_pre_only = Project.load(pre_project_path)
+            reopened_pre_only.revoke_measurement_batch("mirrors-450")
+            still_unknown = reopened_pre_only.trace_rays(rays)
+            self.assertEqual(still_unknown.detector_hits(), {})
 
     def test_measured_project_roundtrip_reproduces_uncertainty(self):
         from raytrace import MeasurementBatch, ResponseMeasurement

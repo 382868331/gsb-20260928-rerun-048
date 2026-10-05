@@ -178,11 +178,16 @@ class RayResult:
 
 class RayTracer:
     def __init__(self, surfaces: list[Surface], materials: MaterialLibrary, settings: TraceSettings | None = None,
-                 measurements: MeasurementBatch | None = None):
+                 measurements: MeasurementBatch | None = None,
+                 measurement_dependent_surfaces: set[str] | None = None):
         self.surfaces = surfaces
         self.materials = materials
         self.settings = settings or TraceSettings()
         self.measurements = measurements
+        # Surfaces whose response any recorded measurement batch declares
+        # (even a revoked one).  When the active batch does not cover them
+        # they must stay unknown instead of falling back to defaults.
+        self.measurement_dependent_surfaces = frozenset(measurement_dependent_surfaces or ())
         self._noise_counter = 0
 
     def _noise(self) -> str:
@@ -423,18 +428,28 @@ class RayTracer:
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 transmitted = tuple(incident)
                 measured_split = self._measured_split(surface, current)
+                dependent = surface.identifier in self.measurement_dependent_surfaces
                 if (
                     measured_split is None
-                    and self.measurements is None
                     and not surface.has_engineering_response()
+                    and (self.measurements is None or dependent)
                 ):
+                    if dependent:
+                        reason = (
+                            f"beamsplitter {surface.identifier!r} depends on measured "
+                            "responses, but no active measurement batch covers it "
+                            "(the basis was revoked or is not active) and it has no "
+                            "independent engineering response"
+                        )
+                    else:
+                        reason = (
+                            f"beamsplitter {surface.identifier!r} has no active measurement "
+                            "batch or independent engineering response"
+                        )
                     event.update({
                         "action": "unknown_engineering_response",
                         "unknown_channels": ["reflectivity", "transmissivity"],
-                        "reason": (
-                            f"beamsplitter {surface.identifier!r} has no active measurement "
-                            "batch or independent engineering response"
-                        ),
+                        "reason": reason,
                         "final_direction": incident,
                         "absorbed_power": 0.0,
                     })
@@ -660,7 +675,11 @@ class RayTracer:
             if surface.kind == "mirror":
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 measured_reflectivity = None
-                if self.measurements is not None and surface.identifier in self.measurements.surfaces_declared():
+                declared = (
+                    self.measurements is not None
+                    and surface.identifier in self.measurements.surfaces_declared()
+                )
+                if declared:
                     measured_reflectivity = self.measurements.interval(
                         surface.identifier, "reflectivity", current.wavelength_nm, None
                     )
@@ -668,9 +687,11 @@ class RayTracer:
                         event.update({
                             "action": "unknown_measured_response",
                             "measurement_batch": self.measurements.batch_id,
+                            "unknown_channels": ["reflectivity"],
                             "reason": (
                                 f"measurement batch {self.measurements.batch_id!r} declares"
                                 f" {surface.identifier!r} without a reflectivity interval"
+                                " for this wavelength/polarization channel"
                             ),
                             "final_direction": incident,
                             "absorbed_power": 0.0,
@@ -679,6 +700,30 @@ class RayTracer:
                         event_counter += 1
                         leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
                         continue
+                if (
+                    measured_reflectivity is None
+                    and not declared
+                    and surface.identifier in self.measurement_dependent_surfaces
+                    and not surface.has_engineering_response()
+                ):
+                    # The mirror's only response basis was measured data and
+                    # no active batch covers it (revoked or not active); the
+                    # default reflectivity must not be substituted.
+                    event.update({
+                        "action": "unknown_measured_response",
+                        "unknown_channels": ["reflectivity"],
+                        "reason": (
+                            f"mirror {surface.identifier!r} depends on a measured "
+                            "reflectivity basis that is revoked or not active; "
+                            "no independent engineering response is specified"
+                        ),
+                        "final_direction": incident,
+                        "absorbed_power": 0.0,
+                    })
+                    event["event_uid"] = event_counter
+                    event_counter += 1
+                    leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                    continue
                 if measured_reflectivity is not None:
                     new_affine = state["weight_affine"].mul(measured_reflectivity, self._noise())
                     absorbed_affine = state["weight_affine"] - new_affine

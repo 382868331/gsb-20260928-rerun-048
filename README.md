@@ -38,6 +38,7 @@
 - 传播用仿射算术跟踪不确定量：每条实测区间是一个取值 [-1, 1] 的符号，分束后再次汇合时同源符号的系数相消而不是按独立误差相加（马赫-曾德汇合中 0.5·(r+(1-r)) 保持精确）。`RayResult.weight_uncertainty` 保存每个终止分支的仿射形式，`detector_summary` 新增 `power_interval`，`TraceBatch.uncertainty_summary()` 按来源把结果分成 `certain`（确定能量）、`possible`（可能范围，含 `nominal` 与 `interval`）和 `unknown`（无法确定的分量），并列出跨分支共享的 `shared_symbols`。
 - 区间与反射、透射、吸收共同受能量约束：同一元件、波长和偏振通道中，若反射、透射、吸收区间的最小可能功率已经无法同时满足 R+T+A=1，批次在登记前直接抛出错误并列出冲突通道；有效区间的相关性保留到分束汇合，不通过裁剪汇总制造可达能量。
 - 两批测量对同一元件/通道给出不相交区间时，`Project.measurement_conflicts()` 列出互斥条件；`Project.compare_measurement_batches(id_a, id_b, rays)` 用相同输入分别追迹并比较探测能量、不确定范围与能量账；`Project.revoke_measurement_batch()` 撤销唯一测量依据后，没有独立工程响应的新追迹会保留未知响应，不会回退到默认反射率。被撤销的批次仍保留在工程档案中，`trace_with_measurements()` 可随时审计旧依据。每个 `TraceBatch` 记录 `measurement_batch_id` 溯源，保存/重开后旧工程与旧批次仍指向原测量依据。
+- 只要元件（分光面或反射镜）曾被任一在册批次声明过，`Project.measurement_dependent_surfaces()` 就把它记为测量依赖：活动批次被撤销或不再覆盖该元件/通道时，新追迹在该元件处以 `unknown_response` 终止，事件用 `surface` 与 `unknown_channels` 明确指出无法继续确定的元件和通道，绝不用标量默认值（如镜面默认 reflectivity=1.0）或其他波段/偏振通道的测量补成确定响应。显式给出的工程响应（`beamsplitter_response_specified`）是独立依据，不受撤销影响。重新登记有效批次后即可开展新追迹；撤销前已保存的工程与追迹批次内容不变，重开后各自仍追溯原测量依据。
 
 ## 简化假设
 
