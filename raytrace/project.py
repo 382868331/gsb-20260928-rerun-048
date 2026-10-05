@@ -102,6 +102,15 @@ class Project:
             return None
         return batch
 
+    def _revoked_batches(self, exclude: str | None = None) -> tuple[MeasurementBatch, ...]:
+        """Revoked batches a new trace must treat as a withdrawn basis."""
+
+        return tuple(
+            batch
+            for batch in self.measurement_batches.values()
+            if batch.revoked and batch.batch_id != exclude
+        )
+
     def trace_with_measurements(self, batch_id: str, rays: list[Ray]) -> "TraceBatch":
         """Trace with one specific batch, even a revoked one (for audits)."""
 
@@ -109,7 +118,11 @@ class Project:
             batch = self.measurement_batches[batch_id]
         except KeyError:
             raise KeyError(f"unknown measurement batch {batch_id!r}") from None
-        tracer = RayTracer(self.surfaces, self.materials, self.settings, measurements=batch)
+        tracer = RayTracer(
+            self.surfaces, self.materials, self.settings,
+            measurements=batch,
+            revoked_batches=self._revoked_batches(exclude=batch_id),
+        )
         return TraceBatch(
             project_name=self.name,
             rays=rays,
@@ -225,7 +238,11 @@ class Project:
 
     def trace_rays(self, rays: list[Ray]) -> "TraceBatch":
         measurements = self.active_measurements()
-        tracer = RayTracer(self.surfaces, self.materials, self.settings, measurements=measurements)
+        tracer = RayTracer(
+            self.surfaces, self.materials, self.settings,
+            measurements=measurements,
+            revoked_batches=self._revoked_batches(),
+        )
         return TraceBatch(
             project_name=self.name,
             rays=rays,

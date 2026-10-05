@@ -178,11 +178,16 @@ class RayResult:
 
 class RayTracer:
     def __init__(self, surfaces: list[Surface], materials: MaterialLibrary, settings: TraceSettings | None = None,
-                 measurements: MeasurementBatch | None = None):
+                 measurements: MeasurementBatch | None = None,
+                 revoked_batches: tuple[MeasurementBatch, ...] = ()):
         self.surfaces = surfaces
         self.materials = materials
         self.settings = settings or TraceSettings()
         self.measurements = measurements
+        # Batches whose measurement basis was withdrawn.  A surface a
+        # revoked batch declared must stay unknown when the active batch
+        # does not cover it; the revoked defaults never fill in.
+        self.revoked_batches = tuple(revoked_batches)
         self._noise_counter = 0
 
     def _noise(self) -> str:
@@ -423,21 +428,29 @@ class RayTracer:
                 reflected = self._reflect(current.direction, scale(normal, -1.0))
                 transmitted = tuple(incident)
                 measured_split = self._measured_split(surface, current)
-                if (
-                    measured_split is None
-                    and self.measurements is None
-                    and not surface.has_engineering_response()
-                ):
+                if measured_split is None and not surface.has_engineering_response():
+                    revoked = self._revoked_declarations(surface.identifier)
+                    if revoked:
+                        reason = (
+                            f"beamsplitter {surface.identifier!r} lost its measurement basis "
+                            f"(revoked batch(es): {', '.join(batch_id for batch_id, _ in revoked)}) "
+                            "and has no active measurement or independent engineering response; "
+                            "the response stays unknown instead of falling back to default values"
+                        )
+                    else:
+                        reason = (
+                            f"beamsplitter {surface.identifier!r} has no active measurement "
+                            "batch or independent engineering response"
+                        )
                     event.update({
                         "action": "unknown_engineering_response",
                         "unknown_channels": ["reflectivity", "transmissivity"],
-                        "reason": (
-                            f"beamsplitter {surface.identifier!r} has no active measurement "
-                            "batch or independent engineering response"
-                        ),
+                        "reason": reason,
                         "final_direction": incident,
                         "absorbed_power": 0.0,
                     })
+                    if revoked:
+                        event["revoked_batches"] = [batch_id for batch_id, _ in revoked]
                     event["event_uid"] = event_counter
                     event_counter += 1
                     leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
@@ -671,6 +684,31 @@ class RayTracer:
                             "reason": (
                                 f"measurement batch {self.measurements.batch_id!r} declares"
                                 f" {surface.identifier!r} without a reflectivity interval"
+                            ),
+                            "final_direction": incident,
+                            "absorbed_power": 0.0,
+                        })
+                        event["event_uid"] = event_counter
+                        event_counter += 1
+                        leaves.append(self._finish(seed, state, event, "unknown_response", point, None))
+                        continue
+                if measured_reflectivity is None:
+                    # A mirror whose only response basis was revoked must not
+                    # silently reuse the default reflectivity; name the
+                    # element, the undetermined channel and the revoked
+                    # batches, then end the branch as unknown.
+                    revoked = self._revoked_declarations(surface.identifier)
+                    if revoked:
+                        event.update({
+                            "action": "revoked_measurement_basis",
+                            "revoked_batches": [batch_id for batch_id, _ in revoked],
+                            "unknown_channels": ["reflectivity"],
+                            "reason": (
+                                f"mirror {surface.identifier!r} lost its measurement basis "
+                                f"(revoked batch(es): {', '.join(batch_id for batch_id, _ in revoked)}) "
+                                "and no active measurement covers its reflectivity; "
+                                "the response stays unknown instead of falling back to "
+                                "the default reflectivity"
                             ),
                             "final_direction": incident,
                             "absorbed_power": 0.0,
@@ -989,6 +1027,20 @@ class RayTracer:
             ray.polarization,
         )
         return reflected_fraction, transmitted_fraction, reflected_field, transmitted_field, s_fraction
+
+    def _revoked_declarations(self, surface_identifier: str) -> list[tuple[str, list[str]]]:
+        """(batch_id, quantities) of revoked batches declaring this surface."""
+
+        declarations: list[tuple[str, list[str]]] = []
+        for batch in self.revoked_batches:
+            quantities = sorted({
+                measurement.quantity
+                for measurement in batch.measurements
+                if measurement.surface == surface_identifier
+            })
+            if quantities:
+                declarations.append((batch.batch_id, quantities))
+        return declarations
 
     def _measured_split(self, surface: Surface, ray: Ray):
         """Per-axis measured interval split, or None when nothing is declared.

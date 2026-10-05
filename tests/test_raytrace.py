@@ -1211,5 +1211,212 @@ class MeasuredResponseTests(unittest.TestCase):
         self.assertEqual(recalculated.energy_ledger(), batch.energy_ledger())
 
 
+class MachZehnderRevocationTests(unittest.TestCase):
+    """Split-and-recombine path: revocation keeps responses unknown."""
+
+    @staticmethod
+    def _mach_zehnder_project():
+        a = math.sqrt(0.5)
+        surfaces = [
+            PlaneSurface("bs1", (0.0, 0.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(2.0)),
+            PlaneSurface("m1", (10.0, 0.0, 0.0), (-a, -a, 0.0),
+                         kind="mirror", aperture=CircularAperture(2.0)),
+            PlaneSurface("m2", (0.0, -10.0, 0.0), (a, a, 0.0),
+                         kind="mirror", aperture=CircularAperture(2.0)),
+            PlaneSurface("bs2", (10.0, -10.0, 0.0), (a, a, 0.0),
+                         kind="beamsplitter", aperture=CircularAperture(2.0)),
+            PlaneSurface("d1", (10.0, -15.0, 0.0), (0.0, 1.0, 0.0),
+                         kind="detector", aperture=CircularAperture(3.0)),
+            PlaneSurface("d2", (15.0, -10.0, 0.0), (1.0, 0.0, 0.0),
+                         kind="detector", aperture=CircularAperture(3.0)),
+        ]
+        return Project("mach-zehnder", surfaces, MaterialLibrary())
+
+    @staticmethod
+    def _mz_batch(batch_id, wavelength_nm=None, polarization=None):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        measurements = []
+        for surface in ("bs1", "bs2"):
+            measurements.append(ResponseMeasurement(
+                surface, "reflectivity", 0.45, 0.55,
+                wavelength_nm=wavelength_nm, polarization=polarization,
+            ))
+            measurements.append(ResponseMeasurement(
+                surface, "absorptivity", 0.0, 0.0,
+                wavelength_nm=wavelength_nm, polarization=polarization,
+            ))
+        if polarization is None:
+            for surface in ("m1", "m2"):
+                measurements.append(ResponseMeasurement(
+                    surface, "reflectivity", 0.95, 1.0, wavelength_nm=wavelength_nm,
+                ))
+        return MeasurementBatch(batch_id, tuple(measurements))
+
+    def test_valid_full_partial_and_remeasure_with_provenance(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement, load_batch
+        project = self._mach_zehnder_project()
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+
+        # 1. Valid measurement: both recombined outputs receive power, and
+        #    the two arms keep their shared measurement symbols correlated.
+        project.add_measurement_batch(self._mz_batch("mz-1"))
+        measured = project.trace_rays(rays)
+        self.assertEqual(measured.status_summary(), {"reached_image": 4})
+        summary = measured.detector_summary()
+        self.assertEqual(sorted(summary), ["d1", "d2"])
+        for detector in ("d1", "d2"):
+            self.assertAlmostEqual(summary[detector]["power"], 0.5 * 0.975, places=12)
+        uncertainty = measured.uncertainty_summary()["src"]
+        self.assertEqual(uncertainty["unknown"], 0.0)
+        self.assertTrue(uncertainty["shared_symbols"])
+
+        # 2. Full revocation of the only basis: no detector hit, the branch
+        #    stops at the first element whose response is now undetermined,
+        #    and the event names the element, channels and revoked batch.
+        project.revoke_measurement_batch("mz-1")
+        revoked = project.trace_rays(rays)
+        self.assertIsNone(revoked.measurement_batch_id)
+        self.assertEqual(revoked.status_summary(), {"unknown_response": 1})
+        self.assertEqual(revoked.detector_hits(), {})
+        event = revoked.results[0].events[-1]
+        self.assertEqual(event["surface"], "bs1")
+        self.assertEqual(event["action"], "unknown_engineering_response")
+        self.assertEqual(event["unknown_channels"], ["reflectivity", "transmissivity"])
+        self.assertEqual(event["revoked_batches"], ["mz-1"])
+        ledger = revoked.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unknown_response"], 1.0)
+        self.assertAlmostEqual(ledger["unaccounted"], 0.0, places=12)
+
+        # 3. Partial basis: the 450 nm channel is measured, the 650 nm
+        #    channel's only basis was revoked.  The 650 nm share stays
+        #    unknown and is not filled from the 450 nm measurements.
+        project.add_measurement_batch(self._mz_batch("wl-650", wavelength_nm=650.0))
+        project.revoke_measurement_batch("wl-650")
+        project.add_measurement_batch(self._mz_batch("wl-450", wavelength_nm=450.0))
+        spectral = Ray.spectral(
+            (-1.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+            wavelengths=[450.0, 650.0], fractions=[0.5, 0.5], label="spec",
+        )
+        partial = project.trace_rays([spectral])
+        self.assertEqual(partial.measurement_batch_id, "wl-450")
+        self.assertEqual(partial.status_summary(), {"reached_image": 4, "unknown_response": 1})
+        unknown = [leaf for leaf in partial.results if leaf.status == "unknown_response"]
+        self.assertEqual(unknown[0].wavelength_nm, 650.0)
+        split_event = unknown[0].events[-1]
+        self.assertEqual(split_event["surface"], "bs1")
+        self.assertEqual(split_event["unknown_channels"], ["reflectivity", "transmissivity"])
+        partial_summary = partial.detector_summary()
+        for detector in ("d1", "d2"):
+            self.assertAlmostEqual(
+                partial_summary[detector]["power"], 0.5 * 0.5 * 0.975, places=12,
+            )
+            self.assertEqual(
+                sorted(partial_summary[detector]["power_by_wavelength"]), ["450 nm"],
+            )
+
+        # 4. Re-measurement enables new traces without rewriting the
+        #    results saved before the revocation.
+        project.add_measurement_batch(self._mz_batch("mz-2"))
+        remeasured = project.trace_rays(rays)
+        self.assertEqual(remeasured.measurement_batch_id, "mz-2")
+        self.assertEqual(remeasured.status_summary(), {"reached_image": 4})
+        self.assertEqual(measured.status_summary(), {"reached_image": 4})
+        self.assertEqual(measured.measurement_batch_id, "mz-1")
+        self.assertEqual(revoked.status_summary(), {"unknown_response": 1})
+        self.assertIsNone(revoked.measurement_batch_id)
+
+        # 5. Save and reopen: every recorded run still points at the
+        #    measurement basis (materials) it used, revoked batches stay
+        #    revoked, and audits reproduce the original numbers.
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            project.save(directory / "project.json")
+            measured.save(directory / "measured.json")
+            revoked.save(directory / "revoked.json")
+            partial.save(directory / "partial.json")
+            remeasured.save(directory / "remeasured.json")
+
+            reopened_project = Project.load(directory / "project.json")
+            reopened = {
+                name: load_batch(directory / f"{name}.json")
+                for name in ("measured", "revoked", "partial", "remeasured")
+            }
+
+        self.assertTrue(reopened_project.measurement_batches["mz-1"].revoked)
+        self.assertTrue(reopened_project.measurement_batches["wl-650"].revoked)
+        self.assertFalse(reopened_project.measurement_batches["wl-450"].revoked)
+        self.assertEqual(reopened_project.active_measurement_batch, "mz-2")
+        self.assertEqual(reopened["measured"].measurement_batch_id, "mz-1")
+        self.assertIsNone(reopened["revoked"].measurement_batch_id)
+        self.assertEqual(reopened["partial"].measurement_batch_id, "wl-450")
+        self.assertEqual(reopened["remeasured"].measurement_batch_id, "mz-2")
+        self.assertEqual(reopened["measured"].detector_summary(), measured.detector_summary())
+        self.assertEqual(reopened["remeasured"].detector_summary(), remeasured.detector_summary())
+
+        # Auditing the revoked basis reproduces the original trace, while a
+        # fresh trace uses the re-registered batch.
+        audited = reopened_project.trace_with_measurements("mz-1", rays)
+        self.assertEqual(audited.detector_summary(), measured.detector_summary())
+        recalculated = reopened_project.trace_rays(rays)
+        self.assertEqual(recalculated.measurement_batch_id, "mz-2")
+        self.assertEqual(recalculated.detector_summary(), remeasured.detector_summary())
+
+    def test_revoked_mirror_basis_does_not_fall_back_to_default_reflectivity(self):
+        project = Project(
+            "mirror-line",
+            [
+                PlaneSurface("m", (1.0, 0.0, 0.0), (-1.0, -1.0, 0.0),
+                             kind="mirror", aperture=CircularAperture(2.0)),
+                PlaneSurface("det", (1.0, -2.0, 0.0), (0.0, 1.0, 0.0),
+                             kind="detector", aperture=CircularAperture(3.0)),
+            ],
+            MaterialLibrary(),
+        )
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        project.add_measurement_batch(MeasurementBatch(
+            "mirror-crew",
+            measurements=(ResponseMeasurement("m", "reflectivity", 0.9, 0.95),),
+        ))
+        rays = [Ray((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        measured = project.trace_rays(rays)
+        self.assertEqual(measured.status_summary(), {"reached_image": 1})
+
+        project.revoke_measurement_batch("mirror-crew")
+        revoked = project.trace_rays(rays)
+        # The default mirror reflectivity (1.0) must not produce a certain
+        # detector hit once the only measurement basis is withdrawn.
+        self.assertEqual(revoked.status_summary(), {"unknown_response": 1})
+        self.assertEqual(revoked.detector_hits(), {})
+        event = revoked.results[0].events[-1]
+        self.assertEqual(event["surface"], "m")
+        self.assertEqual(event["action"], "revoked_measurement_basis")
+        self.assertEqual(event["unknown_channels"], ["reflectivity"])
+        self.assertEqual(event["revoked_batches"], ["mirror-crew"])
+        ledger = revoked.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unknown_response"], 1.0)
+
+    def test_partial_polarization_basis_is_not_filled_from_other_channels(self):
+        from raytrace import MeasurementBatch, ResponseMeasurement
+        project = self._mach_zehnder_project()
+        # Only the s-polarized response of the splitters is measured; the
+        # p channel's batch was revoked.  An unpolarized input carries both
+        # axes, so the p share stays unknown instead of borrowing the
+        # s-channel numbers or the scalar defaults.
+        project.add_measurement_batch(self._mz_batch("pol-p", polarization="p"))
+        project.revoke_measurement_batch("pol-p")
+        project.add_measurement_batch(self._mz_batch("pol-s", polarization="s"))
+        rays = [Ray((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), label="src")]
+        batch = project.trace_rays(rays)
+
+        self.assertEqual(batch.status_summary(), {"unknown_response": 1})
+        self.assertEqual(batch.detector_hits(), {})
+        event = batch.results[0].events[-1]
+        self.assertEqual(event["surface"], "bs1")
+        self.assertEqual(event["unknown_channels"], ["reflectivity", "transmissivity"])
+        ledger = batch.energy_ledger(input_power={"src": 1.0})["src"]
+        self.assertAlmostEqual(ledger["unknown_response"], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
